@@ -5,7 +5,7 @@ description = "LTX-2 plugin for Daydream Scope"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "torchaudio>=2.9.1",
+    "torchaudio==2.9.1",
 ]
 
 [project.entry-points.scope]
@@ -18,19 +18,10 @@ dev = [
 
 [tool.uv]
 override-dependencies = [
-    "torch==2.9.1",
-    "torchvision==0.24.1",
-    "torchaudio==2.9.1",
 ]
 
 [tool.uv.sources]
 daydream-scope = { git = "https://github.com/daydreamlive/scope" }
-torch = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-torchvision = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
 torchaudio = [
     { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]

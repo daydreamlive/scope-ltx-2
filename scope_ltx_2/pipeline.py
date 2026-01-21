@@ -94,16 +94,32 @@ class LTX2Pipeline(Pipeline):
 
     def __init__(
         self,
-        config: LTX2Config,
+        height: int = 512,
+        width: int = 768,
+        num_frames: int = 33,
+        frame_rate: float = 24.0,
+        use_fp8: bool = True,
+        randomize_seed: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        checkpoint_path: str | None = None,
+        gemma_root: str | None = None,
+        **kwargs,  # Accept and ignore unknown params (loras, vae_type, etc.)
     ):
         """Initialize LTX2 pipeline.
 
         Args:
-            config: Pipeline configuration
+            height: Output video height in pixels
+            width: Output video width in pixels
+            num_frames: Number of frames to generate
+            frame_rate: Output frame rate
+            use_fp8: Enable FP8 quantization for transformer
+            randomize_seed: Randomize seed on every generation
             device: Target device for inference
             dtype: Data type for model weights
+            checkpoint_path: Path to LTX2 checkpoint (auto-detected if None)
+            gemma_root: Path to Gemma text encoder (auto-detected if None)
+            **kwargs: Additional parameters (ignored for compatibility)
         """
         import sys
         from pathlib import Path
@@ -122,19 +138,29 @@ class LTX2Pipeline(Pipeline):
 
         self.device = device
         self.dtype = dtype
-        self.config = config
+        
+        # Store config values as instance attributes
+        self.height = height
+        self.width = width
+        self.num_frames = num_frames
+        self.frame_rate = frame_rate
+        self.use_fp8 = use_fp8
+        self.randomize_seed = randomize_seed
+        
+        # Log ignored kwargs for debugging
+        if kwargs:
+            ignored = list(kwargs.keys())
+            logger.debug(f"LTX2Pipeline ignoring unknown kwargs: {ignored}")
 
-        # Get model paths from config
+        # Get model paths
         # Models are downloaded to:
         # - LTX-2/ltx-2-19b-distilled.safetensors (main model checkpoint)
         # - gemma-3-12b-it/ (contains tokenizer and model files)
-        checkpoint_path = getattr(config, "checkpoint_path", None)
         if checkpoint_path is None:
             # Use scope's config helper to get model paths
             ltx2_dir = get_model_file_path("LTX-2")
             checkpoint_path = str(ltx2_dir / "ltx-2-19b-distilled.safetensors")
 
-        gemma_root = getattr(config, "gemma_root", None)
         if gemma_root is None:
             gemma_root = str(get_model_file_path("gemma-3-12b-it"))
 
@@ -143,9 +169,9 @@ class LTX2Pipeline(Pipeline):
         logger.info(f"Loading LTX2 checkpoint from: {checkpoint_path}")
         logger.info(f"Loading Gemma text encoder from: {gemma_root}")
 
-        # Enable FP8 quantization by default to reduce VRAM usage
+        # Enable FP8 quantization to reduce VRAM usage
         # According to official LTX-2 docs, this significantly reduces memory footprint
-        fp8_enabled = getattr(config, "use_fp8", True)
+        fp8_enabled = self.use_fp8
 
         try:
             self.model_ledger = ModelLedger(
@@ -196,7 +222,7 @@ class LTX2Pipeline(Pipeline):
             logger.warning(
                 "FP8 quantization only reduces weight size (~25GB). "
                 "Activations during inference are still in BF16 and are the main memory bottleneck. "
-                f"At {self.config.height}x{self.config.width} with {self.config.num_frames} frames, "
+                f"At {self.height}x{self.width} with {self.num_frames} frames, "
                 "expect ~50-60GB for activations during denoising."
             )
 
@@ -248,11 +274,11 @@ class LTX2Pipeline(Pipeline):
         # Extract parameters
         prompts = kwargs.get("prompts", [{"text": "a beautiful sunset", "weight": 1.0}])
         seed = kwargs.get("seed", kwargs.get("base_seed", 42))
-        num_frames = kwargs.get("num_frames", self.config.num_frames)
-        frame_rate = kwargs.get("frame_rate", self.config.frame_rate)
-        height = kwargs.get("height", self.config.height)
-        width = kwargs.get("width", self.config.width)
-        randomize_seed = kwargs.get("randomize_seed", self.config.randomize_seed)
+        num_frames = kwargs.get("num_frames", self.num_frames)
+        frame_rate = kwargs.get("frame_rate", self.frame_rate)
+        height = kwargs.get("height", self.height)
+        width = kwargs.get("width", self.width)
+        randomize_seed = kwargs.get("randomize_seed", self.randomize_seed)
 
         # Randomize seed if enabled (useful for non-autoregressive models like LTX2)
         # This ensures each chunk gets a different seed for varied outputs

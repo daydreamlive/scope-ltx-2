@@ -5,6 +5,7 @@ description = "LTX-2 plugin for Daydream Scope"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "torchaudio>=2.9.1",
 ]
 
 [project.entry-points.scope]

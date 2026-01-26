@@ -232,7 +232,7 @@ class LTX2Pipeline(Pipeline):
         # - Stage 2: Upsample to full resolution (1024x1536) with distilled LoRA
         # See: https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py
 
-    def __call__(self, **kwargs) -> torch.Tensor:
+    def __call__(self, **kwargs) -> dict:
         """Generate video from text prompt.
 
         Args:
@@ -373,4 +373,4 @@ class LTX2Pipeline(Pipeline):
                 "audio output requires scope audio channel support"
             )
 
-        return video_tensor
+        return {"video": video_tensor}

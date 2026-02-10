@@ -102,7 +102,7 @@ class LTX2Pipeline(Pipeline):
         checkpoint_path: str | None = None,
         gemma_root: str | None = None,
         # New optimization parameters
-        quantization: str | None = None,
+        quantization=None,
         ffn_chunk_size: int | None = 4096,
         offload_text_encoder: bool = True,
         blocks_to_stream: int = 0,
@@ -176,8 +176,22 @@ class LTX2Pipeline(Pipeline):
         logger.info(f"Loading LTX2 checkpoint from: {checkpoint_path}")
         logger.info(f"Loading Gemma text encoder from: {gemma_root}")
 
-        # Resolve quantization: new param takes precedence over legacy use_fp8
-        quantization_value = quantization
+        # Resolve quantization: enum -> string for ModelLedger
+        # Handles Quantization enum, string values, and legacy use_fp8
+        from scope.core.pipelines.enums import Quantization
+        quantization_value = None
+        if quantization is not None:
+            if isinstance(quantization, Quantization):
+                # Map enum values to ModelLedger's string identifiers
+                enum_map = {"fp8_e4m3fn": "fp8", "nvfp4": "nvfp4"}
+                quantization_value = enum_map.get(quantization.value)
+            elif isinstance(quantization, str):
+                if quantization in ("fp8_e4m3fn", "fp8"):
+                    quantization_value = "fp8"
+                elif quantization == "nvfp4":
+                    quantization_value = "nvfp4"
+
+        # Legacy backwards compatibility
         if quantization_value is None and use_fp8:
             quantization_value = "fp8"
 

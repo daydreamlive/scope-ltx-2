@@ -4,8 +4,9 @@ from typing import ClassVar
 
 from pydantic import Field
 
-from scope.core.pipelines.base_schema import BasePipelineConfig, ModeDefaults, height_field, width_field
+from scope.core.pipelines.base_schema import BasePipelineConfig, ModeDefaults, height_field, width_field, ui_field_config
 from scope.core.pipelines.artifacts import HuggingfaceRepoArtifact
+from scope.core.pipelines.enums import Quantization
 
 
 class LTX2Config(BasePipelineConfig):
@@ -107,13 +108,11 @@ class LTX2Config(BasePipelineConfig):
     # - "nvfp4": ~4x memory reduction (requires SM >= 10.0 Blackwell + comfy-kitchen)
     # - None: Full precision BF16
     # Requires PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-    quantization: str | None = Field(
-        default="fp8",
-        description=(
-            "Quantization method for transformer weights. "
-            "'fp8' reduces memory ~2x (requires Ada GPU SM >= 8.9). "
-            "'nvfp4' reduces memory ~4x (requires Blackwell GPU SM >= 10.0). "
-            "None uses full precision BF16."
+    quantization: Quantization | None = Field(
+        default=Quantization.FP8_E4M3FN,
+        description="Quantization method for the transformer model.",
+        json_schema_extra=ui_field_config(
+            order=8, component="quantization", is_load_param=True
         ),
     )
 

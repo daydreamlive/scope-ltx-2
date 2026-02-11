@@ -307,16 +307,14 @@ class ModelLedger:
             import traceback
 
             try:
-                # Import from plugin-local nvfp4 module
-                from scope_ltx_2.nvfp4 import (
+                from scope.core.pipelines.quantization_utils import (
                     check_nvfp4_support,
                     quantize_model_nvfp4,
-                    transformer_block_filter,
                 )
             except ImportError:
                 logger.error(
-                    "Failed to import nvfp4 module from scope_ltx_2. "
-                    "Make sure the plugin is installed correctly."
+                    "Failed to import quantization_utils from scope. "
+                    "Make sure scope >= 0.3.0 is installed."
                 )
                 raise
 
@@ -363,7 +361,6 @@ class ModelLedger:
                 try:
                     quantize_model_nvfp4(
                         model,
-                        layer_filter=transformer_block_filter,
                         streaming=True,
                         target_device=self.device,
                     )
@@ -390,7 +387,7 @@ class ModelLedger:
                 # Quantize transformer blocks to NVFP4
                 logger.info("Quantizing transformer blocks to NVFP4...")
                 try:
-                    quantize_model_nvfp4(model, layer_filter=transformer_block_filter)
+                    quantize_model_nvfp4(model)
                 except Exception as e:
                     logger.error(f"Failed to quantize model to NVFP4: {e}")
                     logger.error(traceback.format_exc())

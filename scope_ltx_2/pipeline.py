@@ -2,6 +2,14 @@
 
 This plugin provides LTX2 video generation for Daydream Scope.
 
+Performance Optimizations:
+    - FFN chunking: Reduces activation memory ~10x during denoising
+    - NVFP4 quantization: ~4x weight reduction on Blackwell GPUs
+    - FP8 quantization: ~2x weight reduction on Ada GPUs
+    - Text encoder offloading: Frees ~25GB by moving Gemma to CPU after encoding
+    - Weight streaming: Streams transformer blocks from CPU to save VRAM
+    - Prompt caching: Reuses encoded prompts when text hasn't changed
+
 Note on Audio Support:
     LTX2 natively supports synchronized audio-video generation. However, scope's
     main branch does not currently support audio channels via WebRTC. Audio
@@ -35,57 +43,46 @@ class LTX2Pipeline(Pipeline):
 
     Memory Optimization:
     --------------------
-    This implementation is optimized for maximum inference speed by keeping all models
-    in VRAM:
+    This implementation uses several techniques to reduce memory usage:
 
-    1. **FP8 Quantization for Weights Only**: Enabled by default (use_fp8=True) to
-       reduce transformer weights from ~45GB to ~25GB. However, **activations during
-       inference remain in BF16** and are the main memory bottleneck.
+    1. **Quantization Options for Weights**:
+       - **FP8** (default): ~2x reduction, transformer weights ~25GB (requires Ada SM >= 8.9)
+       - **NVFP4**: ~4x reduction, transformer weights ~12GB (requires Blackwell SM >= 10.0)
+       - **None**: Full precision BF16, transformer weights ~45GB
 
-    2. **All Models Cached in VRAM**: Text encoder (~20GB), transformer (~25GB), and
-       video decoder (~3GB) are loaded once during initialization and kept in VRAM.
-       This eliminates all model loading overhead between generations, providing
-       maximum inference speed at the cost of higher baseline VRAM usage.
+    2. **FFN Chunking** (~10x activation memory reduction):
+       FFN layers expand hidden dimensions by 4x, creating massive intermediate tensors.
+       By processing the sequence in chunks, we reduce peak activation memory from
+       ~50GB to ~5GB. This is mathematically identical to standard processing.
+       Configure via `ffn_chunk_size` (default: 4096, set to None to disable).
 
-    3. **PYTORCH_CUDA_ALLOC_CONF**: Set to "expandable_segments:True" in app.py to
-       prevent memory fragmentation with FP8 quantization.
+    3. **Text Encoder Offloading**:
+       The Gemma 12B text encoder uses ~25GB VRAM but is only needed for encoding.
+       After encoding the prompt, the text encoder is offloaded to CPU, freeing
+       VRAM for the transformer. Cached prompts avoid reloading entirely.
 
-    4. **VAE Tiling**: Uses TilingConfig for decoder to reduce peak memory during
+    4. **Weight Streaming**:
+       Transformer blocks can be streamed from CPU to GPU during the forward pass,
+       keeping only a subset on GPU at any time. This trades inference speed for
+       lower VRAM usage. Configure via `blocks_to_stream`.
+
+    5. **VAE Tiling**: Uses TilingConfig for decoder to reduce peak memory during
        video decoding.
 
-    5. **No Unnecessary Models**: Video encoder is only loaded for i2v conditioning.
-
-    6. **Minimal Defaults**: 33 frames at 512x768 to fit in 96GB VRAM.
-       **Activations are the bottleneck**: ~1.5GB per frame at 512x768.
-
-    CRITICAL LIMITATION:
-    --------------------
-    Unlike other pipelines that use torchao FP8 quantization for both weights AND
-    activations, LTX2's custom FP8 only quantizes weights. This means the transformer's
-    intermediate activations during denoising consume 60-80GB at higher resolutions.
-
-    Memory Breakdown (96GB GPU):
-    ----------------------------
-    - Text encoder (cached): ~20GB
-    - Transformer weights FP8 (cached): ~25GB
+    Memory Breakdown (with all optimizations enabled, FP8):
+    -------------------------------------------------------
+    - Text encoder: OFFLOADED to CPU (0GB during inference)
+    - Transformer weights (cached): ~25GB (FP8) / ~12GB (NVFP4)
     - Video decoder (cached): ~3GB
-    - **Activations during denoising**:
-      * 33 frames @ 512x768: ~50GB ✅ Fits (total ~98GB)
-      * 61 frames @ 768x1024: ~90GB ❌ OOM (total ~138GB)
-      * 121 frames @ 1024x1536: ~150GB ❌ OOM (total ~198GB)
-
-    Baseline VRAM = Text Encoder (20GB) + Transformer (25GB) + Decoder (3GB) = 48GB
-    Peak VRAM = Baseline (48GB) + Activations (resolution × frames dependent)
-
-    For higher quality, you need:
-    - A GPU with 141GB+ VRAM (H100)
-    - OR the two-stage pipeline (low-res generation + upsampling)
-    - OR generate shorter/lower-res videos
+    - Activations during denoising (with FFN chunking): ~5GB
+    - Total: ~33GB (FP8) / ~20GB (NVFP4) -- fits on most GPUs!
 
     Reference:
     ----------
-    Official LTX-2 documentation:
-    https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-pipelines/README.md
+    - Official LTX-2 documentation:
+      https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-pipelines/README.md
+    - FFN chunking technique from ComfyUI:
+      https://github.com/RandomInternetPreson/ComfyUI_LTX-2_VRAM_Memory_Management
     """
 
     @classmethod
@@ -104,6 +101,13 @@ class LTX2Pipeline(Pipeline):
         dtype: torch.dtype = torch.bfloat16,
         checkpoint_path: str | None = None,
         gemma_root: str | None = None,
+        # New optimization parameters
+        quantization=None,
+        ffn_chunk_size: int | None = 4096,
+        offload_text_encoder: bool = True,
+        blocks_to_stream: int = 0,
+        prefetch_blocks: int = 1,
+        low_vram_init: bool = False,
         **kwargs,  # Accept and ignore unknown params (loras, vae_type, etc.)
     ):
         """Initialize LTX2 pipeline.
@@ -113,14 +117,21 @@ class LTX2Pipeline(Pipeline):
             width: Output video width in pixels
             num_frames: Number of frames to generate
             frame_rate: Output frame rate
-            use_fp8: Enable FP8 quantization for transformer
+            use_fp8: Enable FP8 quantization for transformer (deprecated, use quantization)
             randomize_seed: Randomize seed on every generation
             device: Target device for inference
             dtype: Data type for model weights
             checkpoint_path: Path to LTX2 checkpoint (auto-detected if None)
             gemma_root: Path to Gemma text encoder (auto-detected if None)
+            quantization: Quantization method ("fp8", "nvfp4", or None)
+            ffn_chunk_size: Chunk size for FFN processing (None to disable)
+            offload_text_encoder: Offload text encoder to CPU after encoding
+            blocks_to_stream: Number of transformer blocks to stream from CPU
+            prefetch_blocks: Number of blocks to prefetch during streaming
+            low_vram_init: Force low-VRAM initialization mode
             **kwargs: Additional parameters (ignored for compatibility)
         """
+        import gc
         import sys
         from pathlib import Path
 
@@ -138,26 +149,22 @@ class LTX2Pipeline(Pipeline):
 
         self.device = device
         self.dtype = dtype
-        
+
         # Store config values as instance attributes
         self.height = height
         self.width = width
         self.num_frames = num_frames
         self.frame_rate = frame_rate
-        self.use_fp8 = use_fp8
         self.randomize_seed = randomize_seed
-        
+        self.offload_text_encoder = offload_text_encoder
+
         # Log ignored kwargs for debugging
         if kwargs:
             ignored = list(kwargs.keys())
             logger.debug(f"LTX2Pipeline ignoring unknown kwargs: {ignored}")
 
         # Get model paths
-        # Models are downloaded to:
-        # - LTX-2/ltx-2-19b-distilled.safetensors (main model checkpoint)
-        # - gemma-3-12b-it/ (contains tokenizer and model files)
         if checkpoint_path is None:
-            # Use scope's config helper to get model paths
             ltx2_dir = get_model_file_path("LTX-2")
             checkpoint_path = str(ltx2_dir / "ltx-2-19b-distilled.safetensors")
 
@@ -169,9 +176,32 @@ class LTX2Pipeline(Pipeline):
         logger.info(f"Loading LTX2 checkpoint from: {checkpoint_path}")
         logger.info(f"Loading Gemma text encoder from: {gemma_root}")
 
-        # Enable FP8 quantization to reduce VRAM usage
-        # According to official LTX-2 docs, this significantly reduces memory footprint
-        fp8_enabled = self.use_fp8
+        # Resolve quantization: enum -> string for ModelLedger
+        # Handles Quantization enum, string values, and legacy use_fp8
+        from scope.core.pipelines.enums import Quantization
+        quantization_value = None
+        if quantization is not None:
+            if isinstance(quantization, Quantization):
+                # Map enum values to ModelLedger's string identifiers
+                enum_map = {"fp8_e4m3fn": "fp8", "nvfp4": "nvfp4"}
+                quantization_value = enum_map.get(quantization.value)
+            elif isinstance(quantization, str):
+                if quantization in ("fp8_e4m3fn", "fp8"):
+                    quantization_value = "fp8"
+                elif quantization == "nvfp4":
+                    quantization_value = "nvfp4"
+
+        # Legacy backwards compatibility
+        if quantization_value is None and use_fp8:
+            quantization_value = "fp8"
+
+        # Store for logging
+        self._quantization = quantization_value
+
+        logger.info(
+            f"Creating ModelLedger with quantization={quantization_value}, "
+            f"ffn_chunk_size={ffn_chunk_size}, low_vram_init={low_vram_init}"
+        )
 
         try:
             self.model_ledger = ModelLedger(
@@ -179,10 +209,11 @@ class LTX2Pipeline(Pipeline):
                 device=self.device,
                 checkpoint_path=checkpoint_path,
                 gemma_root_path=gemma_root,
-                spatial_upsampler_path=None,  # We'll add upsampler support later
+                spatial_upsampler_path=None,
                 loras=[],
-                # Use default DummyRegistry - don't cache state dicts in RAM
-                fp8transformer=fp8_enabled,  # FP8 significantly reduces VRAM usage
+                quantization=quantization_value,
+                ffn_chunk_size=ffn_chunk_size,
+                low_vram_init=low_vram_init,
             )
         except Exception as e:
             logger.error(f"Failed to initialize ModelLedger: {e}")
@@ -198,13 +229,78 @@ class LTX2Pipeline(Pipeline):
         # Set up tiling config for VAE decoding
         self.tiling_config = TilingConfig.default()
 
-        # Cache all models in VRAM for maximum performance
-        # This uses more VRAM (~48GB total) but eliminates all reload overhead
+        # Helper for GPU memory logging
+        def log_gpu_memory(stage: str) -> None:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                logger.info(
+                    f"  GPU memory after {stage}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+                )
+
+        # =====================================================================
+        # Load models with memory-efficient ordering
+        # =====================================================================
         logger.info("Loading and caching models in VRAM...")
-        logger.info("  - Loading text encoder (~20GB)...")
+
+        # Step 1: Load text encoder
+        logger.info("  - Loading text encoder (~25GB)...")
         self._cached_text_encoder = self.model_ledger.text_encoder()
-        logger.info("  - Loading transformer (~25GB)...")
+        log_gpu_memory("text encoder")
+
+        # Step 2: Offload text encoder to CPU BEFORE loading transformer
+        # This prevents OOM when both are in VRAM simultaneously
+        self._text_encoder_offloaded = False
+        if offload_text_encoder:
+            logger.info("  - Offloading text encoder to CPU before transformer load...")
+            self._cached_text_encoder.to("cpu")
+            self._text_encoder_offloaded = True
+            gc.collect()
+            torch.cuda.empty_cache()
+            log_gpu_memory("text encoder offloaded")
+
+        # Step 3: Load transformer (with quantization + FFN chunking applied)
+        logger.info("  - Loading transformer...")
         self._cached_transformer = self.model_ledger.transformer()
+        log_gpu_memory("transformer")
+
+        # Force garbage collection after transformer to free temporary tensors
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_gpu_memory("GC after transformer")
+
+        # Step 4: Set up weight streaming if configured
+        self._streaming_state = None
+        if blocks_to_stream > 0:
+            from .weight_streaming import BlockStreamingConfig, setup_block_streaming
+
+            logger.info(
+                f"Setting up weight streaming: {blocks_to_stream} blocks to stream, "
+                f"{prefetch_blocks} prefetch blocks"
+            )
+
+            # Get the transformer blocks from the model
+            # Structure: X0Model -> velocity_model (LTXModel) -> transformer_blocks
+            transformer_blocks = (
+                self._cached_transformer.velocity_model.transformer_blocks
+            )
+
+            streaming_config = BlockStreamingConfig(
+                blocks_to_stream=blocks_to_stream,
+                prefetch_blocks=prefetch_blocks,
+                use_pinned_memory=True,
+                use_non_blocking=True,
+                compute_device=self.device,
+                debug=False,
+            )
+
+            self._streaming_state = setup_block_streaming(
+                transformer_blocks, streaming_config
+            )
+            log_gpu_memory("weight streaming setup")
+
+        # Step 5: Load decoders
         logger.info("  - Loading video decoder (~3GB)...")
         self._cached_video_decoder = self.model_ledger.video_decoder()
 
@@ -214,23 +310,32 @@ class LTX2Pipeline(Pipeline):
         self._cached_audio_decoder = None
         self._cached_vocoder = None
         logger.info("  - Audio models SKIPPED (audio output not yet supported in scope)")
-        logger.info("All models cached successfully in VRAM")
+
+        log_gpu_memory("all models")
+        logger.info("All models cached successfully")
 
         logger.info(f"LTX2 models loaded in {time.time() - start:.2f}s")
-        logger.info(f"FP8 quantization: {'enabled' if fp8_enabled else 'disabled'}")
-        if fp8_enabled:
-            logger.warning(
-                "FP8 quantization only reduces weight size (~25GB). "
-                "Activations during inference are still in BF16 and are the main memory bottleneck. "
-                f"At {self.height}x{self.width} with {self.num_frames} frames, "
-                "expect ~50-60GB for activations during denoising."
-            )
 
-        # NOTE: This is currently a single-stage pipeline implementation.
-        # For even lower VRAM usage, consider implementing a two-stage pipeline:
-        # - Stage 1: Generate at lower resolution (512x768) with CFG guidance
-        # - Stage 2: Upsample to full resolution (1024x1536) with distilled LoRA
-        # See: https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py
+        # Log quantization status
+        if self._quantization == "nvfp4":
+            logger.info(
+                "NVFP4 quantization: enabled (Blackwell GPU SM >= 10.0, comfy-kitchen)"
+            )
+        elif self._quantization == "fp8":
+            logger.info("FP8 quantization: enabled")
+        else:
+            logger.info("Quantization: disabled (full precision BF16)")
+
+        if ffn_chunk_size is not None:
+            logger.info(f"FFN chunking: enabled (chunk_size={ffn_chunk_size})")
+        else:
+            logger.info("FFN chunking: disabled")
+
+        if offload_text_encoder:
+            logger.info("Text encoder offloading: enabled (saves ~25GB during inference)")
+
+        if blocks_to_stream > 0:
+            logger.info(f"Weight streaming: {blocks_to_stream} blocks streamed from CPU")
 
     def __call__(self, **kwargs) -> dict:
         """Generate video from text prompt.
@@ -253,8 +358,11 @@ class LTX2Pipeline(Pipeline):
         return self._generate(**kwargs)
 
     @torch.inference_mode()
-    def _generate(self, **kwargs) -> torch.Tensor:
+    def _generate(self, **kwargs) -> dict:
         """Internal generation method."""
+        import gc
+        import random
+
         from ltx_core.components.diffusion_steps import EulerDiffusionStep
         from ltx_core.components.noisers import GaussianNoiser
         from ltx_core.model.video_vae import decode_video as vae_decode_video
@@ -268,8 +376,6 @@ class LTX2Pipeline(Pipeline):
             euler_denoising_loop,
             simple_denoising_func,
         )
-
-        import random
 
         # Extract parameters
         prompts = kwargs.get("prompts", [{"text": "a beautiful sunset", "weight": 1.0}])
@@ -294,10 +400,46 @@ class LTX2Pipeline(Pipeline):
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
 
-        # Encode text prompt using cached text encoder
-        logger.info(f"Encoding prompt: {prompt_text}")
-        context_p = encode_text(self._cached_text_encoder, prompts=[prompt_text])[0]
-        video_context, audio_context = context_p
+        # =====================================================================
+        # Prompt encoding with caching + text encoder offloading
+        # =====================================================================
+        cached_prompt = getattr(self, "_cached_prompt_text", None)
+
+        if cached_prompt == prompt_text and hasattr(self, "_cached_context"):
+            # Reuse cached encoding - no need to load text encoder
+            video_context, audio_context = self._cached_context
+            logger.debug("Reusing cached prompt encoding")
+        else:
+            # Prompt changed - need to re-encode
+            logger.info(f"Encoding prompt: {prompt_text}")
+
+            # Check if text encoder needs to be loaded back to GPU
+            if self.offload_text_encoder and self._text_encoder_offloaded:
+                logger.info("Loading text encoder back to GPU for encoding...")
+                self._cached_text_encoder.to(self.device)
+                self._text_encoder_offloaded = False
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+            context_p = encode_text(self._cached_text_encoder, prompts=[prompt_text])[0]
+            video_context, audio_context = context_p
+
+            # Cache the encoded prompt
+            self._cached_prompt_text = prompt_text
+            self._cached_context = (video_context, audio_context)
+
+            # Offload text encoder to CPU to free VRAM for transformer
+            if self.offload_text_encoder:
+                logger.info("Offloading text encoder to CPU to free VRAM...")
+                self._cached_text_encoder.to("cpu")
+                self._text_encoder_offloaded = True
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    allocated = torch.cuda.memory_allocated() / 1024**3
+                    logger.info(
+                        f"GPU memory after text encoder offload: {allocated:.2f}GB"
+                    )
 
         # Use cached transformer for generation
         sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)

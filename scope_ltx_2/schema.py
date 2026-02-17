@@ -2,8 +2,13 @@
 
 from typing import ClassVar
 
-from scope.core.pipelines.base_schema import BasePipelineConfig, ModeDefaults, height_field, width_field
 from scope.core.pipelines.artifacts import HuggingfaceRepoArtifact
+from scope.core.pipelines.base_schema import (
+    BasePipelineConfig,
+    ModeDefaults,
+    height_field,
+    width_field,
+)
 
 
 class LTX2Config(BasePipelineConfig):
@@ -49,7 +54,7 @@ class LTX2Config(BasePipelineConfig):
                 "tokenizer.model",
                 "tokenizer_config.json",
             ],
-        )
+        ),
     ]
     supports_lora: ClassVar[bool] = False
     supports_vace: ClassVar[bool] = False
@@ -61,7 +66,7 @@ class LTX2Config(BasePipelineConfig):
     min_dimension: ClassVar[int] = 64
     modified: ClassVar[bool] = False
     recommended_quantization_vram_threshold: ClassVar[float | None] = 32.0
-    
+
     # NOTE: The following flags are NOT in scope main but are used by the branch:
     # - supports_randomize_seed: ClassVar[bool] = True  # LTX2 is bidirectional
     # - supports_num_frames: ClassVar[bool] = True  # LTX2 supports configurable frames

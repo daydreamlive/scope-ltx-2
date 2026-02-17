@@ -1,13 +1,12 @@
 """LTX2 text-to-video pipeline implementation.
 
-This plugin provides LTX2 video generation for Daydream Scope.
+This plugin provides LTX2 video generation with synchronized audio for Daydream Scope.
 
-Note on Audio Support:
-    LTX2 natively supports synchronized audio-video generation. However, scope's
-    main branch does not currently support audio channels via WebRTC. Audio
-    generation is therefore STUBBED in this plugin - audio latents are generated
-    but not decoded or returned. When scope adds audio channel support, this
-    plugin can be updated to enable full audio output.
+Audio Support:
+    LTX2 natively supports synchronized audio-video generation. This plugin decodes
+    both video and audio latents and returns them as {"video": tensor, "audio": tensor,
+    "audio_sample_rate": int} from __call__(). Scope's audio system (AudioProcessingTrack,
+    PipelineProcessor.audio_output_queue) handles routing audio to WebRTC and NDI outputs.
 """
 
 import logging
@@ -16,8 +15,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from scope.core.pipelines.interface import Pipeline
 from scope.core.config import get_model_file_path
+from scope.core.pipelines.interface import Pipeline
+
 from .schema import LTX2Config
 
 if TYPE_CHECKING:
@@ -138,7 +138,7 @@ class LTX2Pipeline(Pipeline):
 
         self.device = device
         self.dtype = dtype
-        
+
         # Store config values as instance attributes
         self.height = height
         self.width = width
@@ -146,7 +146,7 @@ class LTX2Pipeline(Pipeline):
         self.frame_rate = frame_rate
         self.use_fp8 = use_fp8
         self.randomize_seed = randomize_seed
-        
+
         # Log ignored kwargs for debugging
         if kwargs:
             ignored = list(kwargs.keys())
@@ -208,12 +208,11 @@ class LTX2Pipeline(Pipeline):
         logger.info("  - Loading video decoder (~3GB)...")
         self._cached_video_decoder = self.model_ledger.video_decoder()
 
-        # AUDIO STUBBED: scope main doesn't support audio channels via WebRTC yet
-        # Skip loading audio models to save ~1.5GB VRAM
-        # TODO: Enable when scope adds audio channel support
-        self._cached_audio_decoder = None
-        self._cached_vocoder = None
-        logger.info("  - Audio models SKIPPED (audio output not yet supported in scope)")
+        # Load audio decoder and vocoder for synchronized A/V output
+        logger.info("  - Loading audio decoder (~1GB)...")
+        self._cached_audio_decoder = self.model_ledger.audio_decoder()
+        logger.info("  - Loading vocoder (~0.5GB)...")
+        self._cached_vocoder = self.model_ledger.vocoder()
         logger.info("All models cached successfully in VRAM")
 
         logger.info(f"LTX2 models loaded in {time.time() - start:.2f}s")
@@ -233,7 +232,7 @@ class LTX2Pipeline(Pipeline):
         # See: https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py
 
     def __call__(self, **kwargs) -> dict:
-        """Generate video from text prompt.
+        """Generate synchronized video and audio from text prompt.
 
         Args:
             **kwargs: Generation parameters including:
@@ -243,24 +242,26 @@ class LTX2Pipeline(Pipeline):
                 - frame_rate: Frame rate for video (overrides config)
 
         Returns:
-            Video tensor in THWC format with values in [0, 1] range.
-
-        Note:
-            LTX2 natively supports audio generation, but audio output is currently
-            stubbed because scope's main branch doesn't support audio channels via
-            WebRTC. Audio latents are generated but not decoded.
+            Dictionary with:
+                - "video": [T, H, W, C] tensor in [0, 1] range
+                - "audio": [C, S] tensor in [-1, 1] range (if audio was generated)
+                - "audio_sample_rate": int, native sample rate of the audio (e.g. 24000)
         """
         return self._generate(**kwargs)
 
     @torch.inference_mode()
-    def _generate(self, **kwargs) -> torch.Tensor:
+    def _generate(self, **kwargs) -> dict:
         """Internal generation method."""
+        import random
+
         from ltx_core.components.diffusion_steps import EulerDiffusionStep
         from ltx_core.components.noisers import GaussianNoiser
+        from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
         from ltx_core.model.video_vae import decode_video as vae_decode_video
         from ltx_core.text_encoders.gemma import encode_text
         from ltx_core.types import VideoPixelShape
         from ltx_pipelines.utils.constants import (
+            AUDIO_SAMPLE_RATE,
             DISTILLED_SIGMA_VALUES,
         )
         from ltx_pipelines.utils.helpers import (
@@ -268,8 +269,6 @@ class LTX2Pipeline(Pipeline):
             euler_denoising_loop,
             simple_denoising_func,
         )
-
-        import random
 
         # Extract parameters
         prompts = kwargs.get("prompts", [{"text": "a beautiful sunset", "weight": 1.0}])
@@ -347,9 +346,7 @@ class LTX2Pipeline(Pipeline):
 
         # Use tiling for VAE decoding to reduce memory usage
         decoded_video = vae_decode_video(
-            video_state.latent,
-            self._cached_video_decoder,
-            self.tiling_config
+            video_state.latent, self._cached_video_decoder, self.tiling_config
         )
 
         # Convert decoded video iterator to tensor and postprocess
@@ -364,13 +361,23 @@ class LTX2Pipeline(Pipeline):
         # Normalize from [0, 255] uint8 to [0, 1] float
         video_tensor = torch.clamp(video_tensor / 255.0, 0.0, 1.0)
 
-        # AUDIO STUBBED: Audio latents are generated but not decoded
-        # scope's main branch doesn't support audio channels via WebRTC yet
-        # The audio_state contains valid latents that could be decoded when supported
-        if audio_state is not None and audio_state.latent is not None:
-            logger.info(
-                f"Audio latents generated (shape: {audio_state.latent.shape}) but not decoded - "
-                "audio output requires scope audio channel support"
-            )
+        # Decode audio from latents using cached audio decoder and vocoder
+        # Following the official LTX-2 pipeline pattern — always decode audio
+        logger.info("Decoding audio from latents")
+        audio_tensor = vae_decode_audio(
+            audio_state.latent,
+            self._cached_audio_decoder,
+            self._cached_vocoder,
+        )
+        # audio_tensor shape: (channels, samples) - typically (2, N) for stereo at 24kHz
+        logger.info(
+            f"Audio decoded: shape={audio_tensor.shape}, "
+            f"sample_rate={AUDIO_SAMPLE_RATE}, "
+            f"duration={audio_tensor.shape[-1] / AUDIO_SAMPLE_RATE:.3f}s"
+        )
 
-        return {"video": video_tensor}
+        return {
+            "video": video_tensor,
+            "audio": audio_tensor,
+            "audio_sample_rate": AUDIO_SAMPLE_RATE,
+        }

@@ -4,9 +4,15 @@ from typing import ClassVar
 
 from pydantic import Field
 
-from scope.core.pipelines.base_schema import BasePipelineConfig, ModeDefaults, height_field, width_field, ui_field_config
 from scope.core.pipelines.artifacts import HuggingfaceRepoArtifact
 from scope.core.pipelines.enums import Quantization
+from scope.core.pipelines.base_schema import (
+    BasePipelineConfig,
+    ModeDefaults,
+    height_field,
+    width_field,
+    ui_field_config,
+)
 
 
 class LTX2Config(BasePipelineConfig):
@@ -60,7 +66,7 @@ class LTX2Config(BasePipelineConfig):
                 "tokenizer.model",
                 "tokenizer_config.json",
             ],
-        )
+        ),
     ]
     supports_lora: ClassVar[bool] = False
     supports_vace: ClassVar[bool] = False

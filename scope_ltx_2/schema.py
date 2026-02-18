@@ -9,8 +9,6 @@ from scope.core.pipelines.enums import Quantization
 from scope.core.pipelines.base_schema import (
     BasePipelineConfig,
     ModeDefaults,
-    height_field,
-    width_field,
     ui_field_config,
 )
 
@@ -94,8 +92,22 @@ class LTX2Config(BasePipelineConfig):
     # CRITICAL: Set to minimal values to fit in 96GB VRAM
     # Activations during denoising are NOT quantized and scale with resolution×frames
     # Even with FP8 weights, activations use 70+ GB at high settings
-    height: int = height_field(default=512)
-    width: int = width_field(default=768)
+    height: int = Field(
+        default=512,
+        ge=1,
+        description="Output height in pixels",
+        json_schema_extra=ui_field_config(
+            order=4, component="resolution", is_load_param=True
+        ),
+    )
+    width: int = Field(
+        default=768,
+        ge=1,
+        description="Output width in pixels",
+        json_schema_extra=ui_field_config(
+            order=4, component="resolution", is_load_param=True
+        ),
+    )
 
     # Number of frames to generate
     # Reduced to 33 frames (~1.3 seconds) to fit in 96GB VRAM
@@ -222,4 +234,10 @@ class LTX2Config(BasePipelineConfig):
     # LTX2 is bidirectional (not autoregressive), so each chunk is independent.
     # With a fixed seed, the same chunk is regenerated unless the prompt changes.
     # Enable this to get varied outputs between chunks.
-    randomize_seed: bool = False
+    randomize_seed: bool = Field(
+        default=False,
+        description="Randomize seed on every inference call for varied outputs between chunks",
+        json_schema_extra=ui_field_config(
+            order=9, label="Randomize Seed", is_load_param=False
+        ),
+    )

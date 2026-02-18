@@ -110,9 +110,22 @@ class LTX2Config(BasePipelineConfig):
     )
 
     # Number of frames to generate
-    # Reduced to 33 frames (~1.3 seconds) to fit in 96GB VRAM
+    # LTX-2 VAE requires frame counts following 8K+1 (1, 9, 17, 25, 33, 41, 49, ...)
+    # The pipeline snaps to the nearest valid value at runtime.
     # Memory formula: ~1.5GB per frame at 512x768 resolution
-    num_frames: int = 33
+    num_frames: int = Field(
+        default=33,
+        ge=9,
+        le=257,
+        description=(
+            "Number of frames to generate per inference call. "
+            "LTX-2 works best with 8K+1 values (9, 17, 25, 33, 41, 49, ...). "
+            "Other values are snapped to the nearest valid count."
+        ),
+        json_schema_extra=ui_field_config(
+            order=5, label="Frame Count", is_load_param=False
+        ),
+    )
 
     # Frame rate for video generation
     frame_rate: float = 24.0

@@ -380,7 +380,12 @@ class LTX2Pipeline(Pipeline):
         # Extract parameters
         prompts = kwargs.get("prompts", [{"text": "a beautiful sunset", "weight": 1.0}])
         seed = kwargs.get("seed", kwargs.get("base_seed", 42))
-        num_frames = kwargs.get("num_frames", self.num_frames)
+        num_frames_raw = kwargs.get("num_frames", self.num_frames)
+        # Snap to nearest valid 8K+1 value required by LTX-2 VAE
+        num_frames = round((num_frames_raw - 1) / 8) * 8 + 1
+        num_frames = max(num_frames, 9)
+        if num_frames != num_frames_raw:
+            logger.info(f"Snapped num_frames {num_frames_raw} -> {num_frames} (must be 8K+1)")
         frame_rate = kwargs.get("frame_rate", self.frame_rate)
         height = kwargs.get("height", self.height)
         width = kwargs.get("width", self.width)

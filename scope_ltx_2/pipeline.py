@@ -528,4 +528,5 @@ class LTX2Pipeline(Pipeline):
             "video": video_tensor,
             "audio": audio_tensor,
             "audio_sample_rate": AUDIO_SAMPLE_RATE,
+            "frame_rate": frame_rate,
         }

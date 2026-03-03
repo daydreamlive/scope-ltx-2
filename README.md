@@ -1,5 +1,7 @@
 # scope-ltx-2
 
+[![Available on Daydream](https://img.shields.io/badge/Daydream-Install_Node-FF6B35)](https://app.daydream.live/nodes/daydreamlive/ltx-2)
+
 [![Discord](https://img.shields.io/badge/Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/mnfGR4Fjhp)
 
 [Scope](https://github.com/daydreamlive/scope) plugin providing the LTX-2 text-to-video generation pipeline from [Lightricks](https://github.com/Lightricks/LTX-2).

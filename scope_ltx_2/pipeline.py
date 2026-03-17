@@ -1,23 +1,28 @@
-"""LTX2 text-to-video pipeline implementation.
+"""LTX 2.3 audio-video generation pipeline for Daydream Scope.
 
-This plugin provides LTX2 video generation with synchronized audio for Daydream Scope.
+Uses Kijai's separated ComfyUI-format checkpoints (distilled v3 FP8) with
+a standalone inference implementation adapted from ComfyUI's lightricks code.
 
-Performance Optimizations:
-    - FFN chunking: Reduces activation memory ~10x during denoising
-    - NVFP4 quantization: ~4x weight reduction on Blackwell GPUs
-    - FP8 quantization: ~2x weight reduction on Ada GPUs
-    - Text encoder offloading: Frees ~25GB by moving Gemma to CPU after encoding
-    - Weight streaming: Streams transformer blocks from CPU to save VRAM
-    - Prompt caching: Reuses encoded prompts when text hasn't changed
+Memory Management:
+    The 22B FP8 transformer (~23GB) cannot fit on a 24GB GPU alongside other
+    models. The pipeline keeps the transformer on CPU and moves it to GPU
+    only during denoising (after the text encoder is offloaded). This mirrors
+    ComfyUI's --lowvram approach.
+
+    Loading order:
+    1. Gemma 3 12B → GPU → encode prompt → offload to CPU
+    2. Text projection (aggregate embeds) → CPU (tiny, ~1.5GB)
+    3. Transformer → CPU (23GB system RAM)
+    4. VAEs → CPU (small)
+    5. During inference: move transformer to GPU, denoise, move back
 
 Audio Support:
-    LTX2 natively supports synchronized audio-video generation. This plugin decodes
-    both video and audio latents and returns them as {"video": tensor, "audio": tensor,
-    "audio_sample_rate": int} from __call__(). Scope's audio system (AudioProcessingTrack,
-    PipelineProcessor.audio_output_queue) handles routing audio to WebRTC and NDI outputs.
+    LTX 2.3 natively supports synchronized audio-video generation.
 """
 
+import gc
 import logging
+import random
 import time
 from typing import TYPE_CHECKING
 
@@ -33,56 +38,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+DISTILLED_SIGMA_VALUES = [1.0, 0.993, 0.955, 0.865, 0.698, 0.463, 0.216, 0.044, 0.0]
+
+AUDIO_SAMPLE_RATE = 24000
+
+
+def _log_gpu_memory(stage: str) -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"GPU memory after {stage}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
 
 class LTX2Pipeline(Pipeline):
-    """LTX2 text-to-video generation pipeline.
+    """LTX 2.3 audio-video generation pipeline.
 
-    This pipeline wraps the LTX2 distilled model for high-quality video generation
-    from text prompts. Since LTX2 is not autoregressive, it generates complete videos
-    in one shot rather than frame-by-frame.
-
-    Memory Optimization:
-    --------------------
-    This implementation uses several techniques to reduce memory usage:
-
-    1. **Quantization Options for Weights**:
-       - **FP8** (default): ~2x reduction, transformer weights ~25GB (requires Ada SM >= 8.9)
-       - **NVFP4**: ~4x reduction, transformer weights ~12GB (requires Blackwell SM >= 10.0)
-       - **None**: Full precision BF16, transformer weights ~45GB
-
-    2. **FFN Chunking** (~10x activation memory reduction):
-       FFN layers expand hidden dimensions by 4x, creating massive intermediate tensors.
-       By processing the sequence in chunks, we reduce peak activation memory from
-       ~50GB to ~5GB. This is mathematically identical to standard processing.
-       Configure via `ffn_chunk_size` (default: 4096, set to None to disable).
-
-    3. **Text Encoder Offloading**:
-       The Gemma 12B text encoder uses ~25GB VRAM but is only needed for encoding.
-       After encoding the prompt, the text encoder is offloaded to CPU, freeing
-       VRAM for the transformer. Cached prompts avoid reloading entirely.
-
-    4. **Weight Streaming**:
-       Transformer blocks can be streamed from CPU to GPU during the forward pass,
-       keeping only a subset on GPU at any time. This trades inference speed for
-       lower VRAM usage. Configure via `blocks_to_stream`.
-
-    5. **VAE Tiling**: Uses TilingConfig for decoder to reduce peak memory during
-       video decoding.
-
-    Memory Breakdown (with all optimizations enabled, FP8):
-    -------------------------------------------------------
-    - Text encoder: OFFLOADED to CPU (0GB during inference)
-    - Transformer weights (cached): ~25GB (FP8) / ~12GB (NVFP4)
-    - Video decoder (cached): ~3GB
-    - Activations during denoising (with FFN chunking): ~5GB
-    - Total: ~33GB (FP8) / ~20GB (NVFP4) -- fits on most GPUs!
-
-    Reference:
-    ----------
-    - Official LTX-2 documentation:
-      https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-pipelines/README.md
-    - FFN chunking technique from ComfyUI:
-      https://github.com/RandomInternetPreson/ComfyUI_LTX-2_VRAM_Memory_Management
+    Uses Kijai's separated checkpoints with ComfyUI-derived model code.
+    Fits on a 24GB GPU via CPU offloading of the transformer and text encoder.
     """
 
     @classmethod
@@ -95,293 +68,201 @@ class LTX2Pipeline(Pipeline):
         width: int = 768,
         num_frames: int = 33,
         frame_rate: float = 24.0,
-        use_fp8: bool = True,
         randomize_seed: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
-        checkpoint_path: str | None = None,
+        transformer_path: str | None = None,
+        text_projection_path: str | None = None,
+        video_vae_path: str | None = None,
+        audio_vae_path: str | None = None,
         gemma_root: str | None = None,
-        # New optimization parameters
-        quantization=None,
         ffn_chunk_size: int | None = 4096,
         offload_text_encoder: bool = True,
-        blocks_to_stream: int = 0,
-        prefetch_blocks: int = 1,
-        low_vram_init: bool = False,
-        **kwargs,  # Accept and ignore unknown params (loras, vae_type, etc.)
+        **kwargs,
     ):
-        """Initialize LTX2 pipeline.
-
-        Args:
-            height: Output video height in pixels
-            width: Output video width in pixels
-            num_frames: Number of frames to generate
-            frame_rate: Output frame rate
-            use_fp8: Enable FP8 quantization for transformer (deprecated, use quantization)
-            randomize_seed: Randomize seed on every generation
-            device: Target device for inference
-            dtype: Data type for model weights
-            checkpoint_path: Path to LTX2 checkpoint (auto-detected if None)
-            gemma_root: Path to Gemma text encoder (auto-detected if None)
-            quantization: Quantization method ("fp8", "nvfp4", or None)
-            ffn_chunk_size: Chunk size for FFN processing (None to disable)
-            offload_text_encoder: Offload text encoder to CPU after encoding
-            blocks_to_stream: Number of transformer blocks to stream from CPU
-            prefetch_blocks: Number of blocks to prefetch during streaming
-            low_vram_init: Force low-VRAM initialization mode
-            **kwargs: Additional parameters (ignored for compatibility)
-        """
-        import gc
-        import sys
         from pathlib import Path
 
-        # Add the modules directory to sys.path so ltx_core and ltx_pipelines can be imported
-        modules_dir = Path(__file__).parent / "modules"
-        if str(modules_dir) not in sys.path:
-            sys.path.insert(0, str(modules_dir))
-
-        from ltx_core.model.video_vae import TilingConfig
-        from ltx_pipelines.utils import ModelLedger
-        from ltx_pipelines.utils.types import PipelineComponents
+        from .model_loader import load_transformer, load_vae
+        from .text_encoder import TextEmbeddingProjection, load_gemma_text_encoder
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.device = device
         self.dtype = dtype
-
-        # Store config values as instance attributes
         self.height = height
         self.width = width
         self.num_frames = num_frames
         self.frame_rate = frame_rate
         self.randomize_seed = randomize_seed
         self.offload_text_encoder = offload_text_encoder
+        self.ffn_chunk_size = ffn_chunk_size
 
-        # Log ignored kwargs for debugging
         if kwargs:
-            ignored = list(kwargs.keys())
-            logger.debug(f"LTX2Pipeline ignoring unknown kwargs: {ignored}")
+            logger.debug(f"LTX2Pipeline ignoring unknown kwargs: {list(kwargs.keys())}")
 
-        # Get model paths
-        if checkpoint_path is None:
-            ltx2_dir = get_model_file_path("LTX-2")
-            checkpoint_path = str(ltx2_dir / "ltx-2-19b-distilled.safetensors")
+        start = time.time()
 
+        # Resolve model paths
+        kijai_dir = get_model_file_path("LTX2.3_comfy")
+
+        if transformer_path is None:
+            transformer_path = str(kijai_dir / "diffusion_models" / "ltx-2.3-22b-distilled_transformer_only_fp8_input_scaled_v3.safetensors")
+        if text_projection_path is None:
+            text_projection_path = str(kijai_dir / "text_encoders" / "ltx-2.3_text_projection_bf16.safetensors")
+        if video_vae_path is None:
+            video_vae_path = str(kijai_dir / "vae" / "LTX23_video_vae_bf16.safetensors")
+        if audio_vae_path is None:
+            audio_vae_path = str(kijai_dir / "vae" / "LTX23_audio_vae_bf16.safetensors")
         if gemma_root is None:
             gemma_root = str(get_model_file_path("gemma-3-12b-it"))
 
-        # Initialize model ledger for loading LTX2 components
-        start = time.time()
-        logger.info(f"Loading LTX2 checkpoint from: {checkpoint_path}")
-        logger.info(f"Loading Gemma text encoder from: {gemma_root}")
+        logger.info(f"Transformer: {transformer_path}")
+        logger.info(f"Text projection: {text_projection_path}")
+        logger.info(f"Video VAE: {video_vae_path}")
+        logger.info(f"Audio VAE: {audio_vae_path}")
+        logger.info(f"Gemma: {gemma_root}")
 
-        # Resolve quantization: enum -> string for ModelLedger
-        # Handles Quantization enum, string values, and legacy use_fp8
-        from scope.core.pipelines.enums import Quantization
-        quantization_value = None
-        if quantization is not None:
-            if isinstance(quantization, Quantization):
-                # Map enum values to ModelLedger's string identifiers
-                enum_map = {"fp8_e4m3fn": "fp8", "nvfp4": "nvfp4"}
-                quantization_value = enum_map.get(quantization.value)
-            elif isinstance(quantization, str):
-                if quantization in ("fp8_e4m3fn", "fp8"):
-                    quantization_value = "fp8"
-                elif quantization == "nvfp4":
-                    quantization_value = "nvfp4"
-
-        # Legacy backwards compatibility
-        if quantization_value is None and use_fp8:
-            quantization_value = "fp8"
-
-        # Store for logging
-        self._quantization = quantization_value
-
-        logger.info(
-            f"Creating ModelLedger with quantization={quantization_value}, "
-            f"ffn_chunk_size={ffn_chunk_size}, low_vram_init={low_vram_init}"
+        # Step 1: Load text encoder to GPU, then offload
+        logger.info("Loading Gemma 3 12B text encoder...")
+        self._text_encoder, self._tokenizer = load_gemma_text_encoder(
+            gemma_root, device=device, dtype=dtype
         )
+        self._text_encoder_on_gpu = True
+        _log_gpu_memory("text encoder loaded")
 
-        try:
-            self.model_ledger = ModelLedger(
-                dtype=self.dtype,
-                device=self.device,
-                checkpoint_path=checkpoint_path,
-                gemma_root_path=gemma_root,
-                spatial_upsampler_path=None,
-                loras=[],
-                quantization=quantization_value,
-                ffn_chunk_size=ffn_chunk_size,
-                low_vram_init=low_vram_init,
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize ModelLedger: {e}")
-            logger.error(f"Make sure model checkpoint is at: {checkpoint_path}")
-            logger.error(f"Make sure Gemma text encoder is at: {gemma_root}")
-            raise
-
-        self.pipeline_components = PipelineComponents(
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-        # Set up tiling config for VAE decoding
-        self.tiling_config = TilingConfig.default()
-
-        # Helper for GPU memory logging
-        def log_gpu_memory(stage: str) -> None:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                allocated = torch.cuda.memory_allocated() / 1024**3
-                reserved = torch.cuda.memory_reserved() / 1024**3
-                logger.info(
-                    f"  GPU memory after {stage}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
-                )
-
-        # =====================================================================
-        # Load models with memory-efficient ordering
-        # =====================================================================
-        logger.info("Loading and caching models in VRAM...")
-
-        # Step 1: Load text encoder
-        logger.info("  - Loading text encoder (~25GB)...")
-        self._cached_text_encoder = self.model_ledger.text_encoder()
-        log_gpu_memory("text encoder")
-
-        # Step 2: Offload text encoder to CPU BEFORE loading transformer
-        # This prevents OOM when both are in VRAM simultaneously
-        self._text_encoder_offloaded = False
         if offload_text_encoder:
-            logger.info("  - Offloading text encoder to CPU before transformer load...")
-            self._cached_text_encoder.to("cpu")
-            self._text_encoder_offloaded = True
+            logger.info("Offloading text encoder to CPU...")
+            self._text_encoder.to("cpu")
+            self._text_encoder_on_gpu = False
             gc.collect()
             torch.cuda.empty_cache()
-            log_gpu_memory("text encoder offloaded")
+            _log_gpu_memory("text encoder offloaded")
 
-        # Step 3: Load transformer (with quantization + FFN chunking applied)
-        logger.info("  - Loading transformer...")
-        self._cached_transformer = self.model_ledger.transformer()
-        log_gpu_memory("transformer")
+        # Step 2: Load text projection (aggregate embeds, ~1.5GB on CPU)
+        logger.info("Loading text projection (aggregate embeds)...")
+        self._text_projection = TextEmbeddingProjection.from_checkpoint(
+            text_projection_path, dtype=dtype
+        )
+        self._text_projection_on_gpu = False
 
-        # Force garbage collection after transformer to free temporary tensors
-        gc.collect()
-        torch.cuda.empty_cache()
-        log_gpu_memory("GC after transformer")
-
-        # Step 4: Set up weight streaming if configured
-        self._streaming_state = None
-        if blocks_to_stream > 0:
-            from .weight_streaming import BlockStreamingConfig, setup_block_streaming
-
-            logger.info(
-                f"Setting up weight streaming: {blocks_to_stream} blocks to stream, "
-                f"{prefetch_blocks} prefetch blocks"
-            )
-
-            # Get the transformer blocks from the model
-            # Structure: X0Model -> velocity_model (LTXModel) -> transformer_blocks
-            transformer_blocks = (
-                self._cached_transformer.velocity_model.transformer_blocks
-            )
-
-            streaming_config = BlockStreamingConfig(
-                blocks_to_stream=blocks_to_stream,
-                prefetch_blocks=prefetch_blocks,
-                use_pinned_memory=True,
-                use_non_blocking=True,
-                compute_device=self.device,
-                debug=False,
-            )
-
-            self._streaming_state = setup_block_streaming(
-                transformer_blocks, streaming_config
-            )
-            log_gpu_memory("weight streaming setup")
-
-        # Step 5: Load decoders
-        logger.info("  - Loading video decoder (~3GB)...")
-        self._cached_video_decoder = self.model_ledger.video_decoder()
-
-
-        log_gpu_memory("all models")
-        logger.info("All models cached successfully")
-        # Load audio decoder and vocoder for synchronized A/V output
-        logger.info("  - Loading audio decoder (~1GB)...")
-        self._cached_audio_decoder = self.model_ledger.audio_decoder()
-        logger.info("  - Loading vocoder (~0.5GB)...")
-        self._cached_vocoder = self.model_ledger.vocoder()
-        logger.info("All models cached successfully in VRAM")
-
-        logger.info(f"LTX2 models loaded in {time.time() - start:.2f}s")
-
-        # Log quantization status
-        if self._quantization == "nvfp4":
-            logger.info(
-                "NVFP4 quantization: enabled (Blackwell GPU SM >= 10.0, comfy-kitchen)"
-            )
-        elif self._quantization == "fp8":
-            logger.info("FP8 quantization: enabled")
-        else:
-            logger.info("Quantization: disabled (full precision BF16)")
+        # Step 3: Load transformer to CPU (23GB, too large for GPU alongside other models)
+        logger.info("Loading transformer (FP8, will stay on CPU until inference)...")
+        self._transformer = load_transformer(transformer_path, device=torch.device("cpu"), dtype=dtype)
+        self._transformer_on_gpu = False
 
         if ffn_chunk_size is not None:
-            logger.info(f"FFN chunking: enabled (chunk_size={ffn_chunk_size})")
-        else:
-            logger.info("FFN chunking: disabled")
+            self._apply_ffn_chunking(ffn_chunk_size)
 
-        if offload_text_encoder:
-            logger.info("Text encoder offloading: enabled (saves ~25GB during inference)")
+        _log_gpu_memory("transformer loaded (on CPU)")
 
-        if blocks_to_stream > 0:
-            logger.info(f"Weight streaming: {blocks_to_stream} blocks streamed from CPU")
+        # Step 4: Load VAEs to CPU
+        logger.info("Loading video VAE...")
+        self._video_vae_sd = load_vae(video_vae_path, device="cpu", dtype=dtype)
+        self._video_vae = self._build_video_vae(self._video_vae_sd, torch.device("cpu"), dtype)
+
+        logger.info("Loading audio VAE...")
+        self._audio_vae_sd = load_vae(audio_vae_path, device="cpu", dtype=dtype)
+        self._audio_vae = self._build_audio_vae(self._audio_vae_sd, torch.device("cpu"), dtype)
+
+        # Prompt cache
+        self._cached_prompt_text = None
+        self._cached_context = None
+
+        logger.info(f"LTX 2.3 pipeline loaded in {time.time() - start:.1f}s")
+        _log_gpu_memory("all models loaded")
+
+    def _apply_ffn_chunking(self, chunk_size: int):
+        for block in self._transformer.transformer_blocks:
+            if hasattr(block, 'ff'):
+                original_ff = block.ff
+                block.ff = _ChunkedFFN(original_ff, chunk_size)
+            if hasattr(block, 'audio_ff'):
+                original_aff = block.audio_ff
+                block.audio_ff = _ChunkedFFN(original_aff, chunk_size)
+        logger.info(f"FFN chunking applied with chunk_size={chunk_size}")
+
+    def _move_transformer_to_gpu(self):
+        if self._transformer_on_gpu:
+            return
+        logger.info("Moving transformer to GPU (preserving dtypes)...")
+        for param in self._transformer.parameters():
+            param.data = param.data.to(device=self.device)
+        for buf in self._transformer.buffers():
+            buf.data = buf.data.to(device=self.device)
+        if hasattr(self._transformer, '_fp8_scales'):
+            self._transformer._fp8_scales = {
+                k: v.to(device=self.device) for k, v in self._transformer._fp8_scales.items()
+            }
+        self._transformer_on_gpu = True
+        torch.cuda.synchronize()
+        _log_gpu_memory("transformer on GPU")
+
+    def _move_transformer_to_cpu(self):
+        if not self._transformer_on_gpu:
+            return
+        logger.info("Moving transformer to CPU...")
+        for param in self._transformer.parameters():
+            param.data = param.data.to(device="cpu")
+        for buf in self._transformer.buffers():
+            buf.data = buf.data.to(device="cpu")
+        if hasattr(self._transformer, '_fp8_scales'):
+            self._transformer._fp8_scales = {
+                k: v.to(device="cpu") for k, v in self._transformer._fp8_scales.items()
+            }
+        self._transformer_on_gpu = False
+        gc.collect()
+        torch.cuda.empty_cache()
+        _log_gpu_memory("transformer offloaded to CPU")
+
+    def _build_video_vae(self, state_dict: dict, device: torch.device, dtype: torch.dtype):
+        try:
+            import sys
+            from pathlib import Path
+            modules_dir = Path(__file__).parent / "modules"
+            if str(modules_dir) not in sys.path:
+                sys.path.insert(0, str(modules_dir))
+
+            from ltx_core.model.video_vae import VideoVAE
+            vae = VideoVAE()
+            vae.load_state_dict(state_dict, strict=False)
+            vae = vae.to(device=device, dtype=dtype)
+            vae.eval()
+            logger.info("Video VAE loaded via ltx_core")
+            return vae
+        except ImportError:
+            logger.warning("ltx_core not available, storing raw video VAE state dict")
+            return _StateDictVAE(state_dict, device, dtype)
+
+    def _build_audio_vae(self, state_dict: dict, device: torch.device, dtype: torch.dtype):
+        try:
+            import sys
+            from pathlib import Path
+            modules_dir = Path(__file__).parent / "modules"
+            if str(modules_dir) not in sys.path:
+                sys.path.insert(0, str(modules_dir))
+
+            from ltx_core.model.audio_vae import AudioVAE
+            vae = AudioVAE()
+            vae.load_state_dict(state_dict, strict=False)
+            vae = vae.to(device=device, dtype=dtype)
+            vae.eval()
+            logger.info("Audio VAE loaded via ltx_core")
+            return vae
+        except ImportError:
+            logger.warning("ltx_core not available, storing raw audio VAE state dict")
+            return _StateDictVAE(state_dict, device, dtype)
 
     def __call__(self, **kwargs) -> dict:
-        """Generate synchronized video and audio from text prompt.
-
-        Args:
-            **kwargs: Generation parameters including:
-                - prompts: List of prompt dictionaries with 'text' and 'weight' keys
-                - seed: Random seed for generation
-                - num_frames: Number of frames to generate (overrides config)
-                - frame_rate: Frame rate for video (overrides config)
-
-        Returns:
-            Dictionary with:
-                - "video": [T, H, W, C] tensor in [0, 1] range
-                - "audio": [C, S] tensor in [-1, 1] range (if audio was generated)
-                - "audio_sample_rate": int, native sample rate of the audio (e.g. 24000)
-        """
         return self._generate(**kwargs)
 
     @torch.inference_mode()
     def _generate(self, **kwargs) -> dict:
-        """Internal generation method."""
-        import gc
-        import random
+        from .text_encoder import encode_prompt
 
-        from ltx_core.components.diffusion_steps import EulerDiffusionStep
-        from ltx_core.components.noisers import GaussianNoiser
-        from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
-        from ltx_core.model.video_vae import decode_video as vae_decode_video
-        from ltx_core.text_encoders.gemma import encode_text
-        from ltx_core.types import VideoPixelShape
-        from ltx_pipelines.utils.constants import (
-            AUDIO_SAMPLE_RATE,
-            DISTILLED_SIGMA_VALUES,
-        )
-        from ltx_pipelines.utils.helpers import (
-            denoise_audio_video,
-            euler_denoising_loop,
-            simple_denoising_func,
-        )
-
-        # Extract parameters
         prompts = kwargs.get("prompts", [{"text": "a beautiful sunset", "weight": 1.0}])
         seed = kwargs.get("seed", kwargs.get("base_seed", 42))
         num_frames_raw = kwargs.get("num_frames", self.num_frames)
-        # Snap to nearest valid 8K+1 value required by LTX-2 VAE
         num_frames = round((num_frames_raw - 1) / 8) * 8 + 1
         num_frames = max(num_frames, 9)
         if num_frames != num_frames_raw:
@@ -391,137 +272,129 @@ class LTX2Pipeline(Pipeline):
         width = kwargs.get("width", self.width)
         randomize_seed = kwargs.get("randomize_seed", self.randomize_seed)
 
-        # Randomize seed if enabled (useful for non-autoregressive models like LTX2)
-        # This ensures each chunk gets a different seed for varied outputs
         if randomize_seed:
             seed = random.randint(0, 2**31 - 1)
             logger.info(f"Randomized seed: {seed}")
 
-        # Convert prompts to single text (for now, just use first prompt)
         prompt_text = prompts[0]["text"] if prompts else "a beautiful sunset"
 
-        # Set up generator and components
         generator = torch.Generator(device=self.device).manual_seed(seed)
-        noiser = GaussianNoiser(generator=generator)
-        stepper = EulerDiffusionStep()
 
-        # =====================================================================
-        # Prompt encoding with caching + text encoder offloading
-        # =====================================================================
-        cached_prompt = getattr(self, "_cached_prompt_text", None)
-
-        if cached_prompt == prompt_text and hasattr(self, "_cached_context"):
-            # Reuse cached encoding - no need to load text encoder
-            video_context, audio_context = self._cached_context
+        # =================================================================
+        # Text encoding (Gemma on GPU → aggregate embeds → offload)
+        # =================================================================
+        if self._cached_prompt_text == prompt_text and self._cached_context is not None:
+            context = self._cached_context
             logger.debug("Reusing cached prompt encoding")
         else:
-            # Prompt changed - need to re-encode
             logger.info(f"Encoding prompt: {prompt_text}")
 
-            # Check if text encoder needs to be loaded back to GPU
-            if self.offload_text_encoder and self._text_encoder_offloaded:
-                logger.info("Loading text encoder back to GPU for encoding...")
-                self._cached_text_encoder.to(self.device)
-                self._text_encoder_offloaded = False
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+            # Ensure text encoder is on GPU
+            if not self._text_encoder_on_gpu:
+                logger.info("Loading text encoder back to GPU...")
+                self._text_encoder.to(self.device)
+                self._text_encoder_on_gpu = True
+                torch.cuda.synchronize()
 
-            context_p = encode_text(self._cached_text_encoder, prompts=[prompt_text])[0]
-            video_context, audio_context = context_p
-
-            # Cache the encoded prompt
-            self._cached_prompt_text = prompt_text
-            self._cached_context = (video_context, audio_context)
-
-            # Offload text encoder to CPU to free VRAM for transformer
-            if self.offload_text_encoder:
-                logger.info("Offloading text encoder to CPU to free VRAM...")
-                self._cached_text_encoder.to("cpu")
-                self._text_encoder_offloaded = True
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    allocated = torch.cuda.memory_allocated() / 1024**3
-                    logger.info(
-                        f"GPU memory after text encoder offload: {allocated:.2f}GB"
-                    )
-
-        # Use cached transformer for generation
-        sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
-
-        # Define denoising loop
-        def denoising_loop(sigmas, video_state, audio_state, stepper):
-            return euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper,
-                denoise_fn=simple_denoising_func(
-                    video_context=video_context,
-                    audio_context=audio_context,
-                    transformer=self._cached_transformer,
-                ),
+            all_layer_hiddens, attention_mask = encode_prompt(
+                self._text_encoder,
+                self._tokenizer,
+                prompt_text,
+                device=self.device,
+                dtype=self.dtype,
             )
 
-        # Set up output shape (LTX2 generates at full resolution in one stage for simplicity)
-        output_shape = VideoPixelShape(
-            batch=1,
-            frames=num_frames,
-            width=width,
-            height=height,
-            fps=frame_rate,
-        )
+            # Offload text encoder before running projection
+            if self.offload_text_encoder:
+                logger.info("Offloading text encoder to CPU...")
+                self._text_encoder.to("cpu")
+                self._text_encoder_on_gpu = False
+                gc.collect()
+                torch.cuda.empty_cache()
 
-        # No image conditioning for now
-        conditionings = []
+            # Run text projection (aggregate embeds) on GPU
+            self._text_projection.to(self.device)
+            self._text_projection_on_gpu = True
+            projected = self._text_projection(all_layer_hiddens, attention_mask)
+            del all_layer_hiddens
 
-        # Generate video and audio latents
-        logger.info(f"Generating {num_frames} frames at {height}x{width}")
-        video_state, audio_state = denoise_audio_video(
-            output_shape=output_shape,
-            conditionings=conditionings,
-            noiser=noiser,
-            sigmas=sigmas,
-            stepper=stepper,
-            denoising_loop_fn=denoising_loop,
-            components=self.pipeline_components,
-            dtype=self.dtype,
+            # Offload text projection
+            self._text_projection.to("cpu")
+            self._text_projection_on_gpu = False
+
+            # Run embedding connectors on GPU (need transformer on GPU for this)
+            self._move_transformer_to_gpu()
+            context = self._transformer.preprocess_text_embeds(projected, unprocessed=True)
+            # Move transformer back to CPU to free VRAM for latent prep
+            self._move_transformer_to_cpu()
+
+            del projected
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            self._cached_prompt_text = prompt_text
+            self._cached_context = context
+
+        # =================================================================
+        # Prepare latent noise
+        # =================================================================
+        vae_temporal_factor = 8
+        vae_spatial_factor = 32
+
+        latent_frames = (num_frames - 1) // vae_temporal_factor + 1
+        latent_height = height // vae_spatial_factor
+        latent_width = width // vae_spatial_factor
+        latent_channels = 128
+
+        video_latents = torch.randn(
+            (1, latent_channels, latent_frames, latent_height, latent_width),
+            generator=generator,
             device=self.device,
+            dtype=self.dtype,
         )
 
-        # Decode video from latents using cached decoder
-        logger.info("Decoding video from latents")
-
-        # Use tiling for VAE decoding to reduce memory usage
-        decoded_video = vae_decode_video(
-            video_state.latent, self._cached_video_decoder, self.tiling_config
+        audio_channels = 8
+        audio_freq_bins = 16
+        video_duration_sec = num_frames / frame_rate
+        audio_latent_time = round(video_duration_sec * 25)
+        audio_latents = torch.randn(
+            (1, audio_channels, audio_latent_time, audio_freq_bins),
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
         )
 
-        # Convert decoded video iterator to tensor and postprocess
-        # LTX2 vae_decode_video returns an iterator of frame chunks
-        video_frames = []
-        for chunk in decoded_video:
-            video_frames.append(chunk.to(torch.float32))
+        # =================================================================
+        # 8-step Euler denoising (transformer on GPU)
+        # =================================================================
+        sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=self.device, dtype=self.dtype)
 
-        # Concatenate all chunks along time dimension -> [T, H, W, C]
-        video_tensor = torch.cat(video_frames, dim=0)
+        logger.info(f"Denoising {num_frames} frames at {height}x{width} ({len(sigmas)-1} steps)")
 
-        # Normalize from [0, 255] uint8 to [0, 1] float
-        video_tensor = torch.clamp(video_tensor / 255.0, 0.0, 1.0)
+        self._move_transformer_to_gpu()
 
-        # Decode audio from latents using cached audio decoder and vocoder
-        # Following the official LTX-2 pipeline pattern — always decode audio
-        logger.info("Decoding audio from latents")
-        audio_tensor = vae_decode_audio(
-            audio_state.latent,
-            self._cached_audio_decoder,
-            self._cached_vocoder,
+        video_latents, audio_latents = self._euler_denoise(
+            video_latents=video_latents,
+            audio_latents=audio_latents,
+            context=context,
+            sigmas=sigmas,
+            frame_rate=frame_rate,
         )
-        # audio_tensor shape: (channels, samples) - typically (2, N) for stereo at 24kHz
+
+        self._move_transformer_to_cpu()
+
+        # =================================================================
+        # VAE decode
+        # =================================================================
+        logger.info("Decoding video from latents...")
+        video_tensor = self._decode_video(video_latents)
+
+        logger.info("Decoding audio from latents...")
+        audio_tensor = self._decode_audio(audio_latents)
+
         logger.info(
-            f"Audio decoded: shape={audio_tensor.shape}, "
-            f"sample_rate={AUDIO_SAMPLE_RATE}, "
-            f"duration={audio_tensor.shape[-1] / AUDIO_SAMPLE_RATE:.3f}s"
+            f"Generated: video={video_tensor.shape}, audio={audio_tensor.shape}, "
+            f"duration={audio_tensor.shape[-1] / AUDIO_SAMPLE_RATE:.2f}s"
         )
 
         return {
@@ -530,3 +403,116 @@ class LTX2Pipeline(Pipeline):
             "audio_sample_rate": AUDIO_SAMPLE_RATE,
             "frame_rate": frame_rate,
         }
+
+    def _euler_denoise(
+        self,
+        video_latents: torch.Tensor,
+        audio_latents: torch.Tensor,
+        context: torch.Tensor,
+        sigmas: torch.Tensor,
+        frame_rate: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run 8-step Euler sampling with the distilled sigma schedule."""
+        v_noisy = video_latents * sigmas[0]
+        a_noisy = audio_latents * sigmas[0]
+
+        for i in range(len(sigmas) - 1):
+            sigma = sigmas[i]
+            sigma_next = sigmas[i + 1]
+
+            timestep = sigma.expand(v_noisy.shape[0])
+            a_timestep = sigma.expand(a_noisy.shape[0])
+
+            x_input = [v_noisy, a_noisy]
+
+            model_output = self._transformer(
+                x=x_input,
+                timestep=[timestep, a_timestep],
+                context=context,
+                attention_mask=None,
+                frame_rate=frame_rate,
+            )
+
+            if isinstance(model_output, list):
+                v_pred = model_output[0]
+                a_pred = model_output[1] if len(model_output) > 1 else a_noisy
+            else:
+                v_pred = model_output
+                a_pred = a_noisy
+
+            dt = sigma_next - sigma
+            v_noisy = v_noisy + v_pred * dt
+            a_noisy = a_noisy + a_pred * dt
+
+            logger.debug(f"Step {i+1}/{len(sigmas)-1}: sigma={sigma:.4f} -> {sigma_next:.4f}")
+
+        return v_noisy, a_noisy
+
+    def _decode_video(self, latents: torch.Tensor) -> torch.Tensor:
+        try:
+            import sys
+            from pathlib import Path
+            modules_dir = Path(__file__).parent / "modules"
+            if str(modules_dir) not in sys.path:
+                sys.path.insert(0, str(modules_dir))
+
+            from ltx_core.model.video_vae import TilingConfig, decode_video as vae_decode_video
+
+            self._video_vae.to(self.device)
+            tiling_config = TilingConfig.default()
+            decoded = vae_decode_video(latents, self._video_vae, tiling_config)
+
+            frames = []
+            for chunk in decoded:
+                frames.append(chunk.to(torch.float32))
+            video = torch.cat(frames, dim=0)
+            video = torch.clamp(video / 255.0, 0.0, 1.0)
+            self._video_vae.to("cpu")
+            return video
+
+        except ImportError:
+            logger.warning("ltx_core not available for video decode, returning raw latents")
+            return latents.squeeze(0).permute(1, 2, 3, 0).float()
+
+    def _decode_audio(self, latents: torch.Tensor) -> torch.Tensor:
+        try:
+            import sys
+            from pathlib import Path
+            modules_dir = Path(__file__).parent / "modules"
+            if str(modules_dir) not in sys.path:
+                sys.path.insert(0, str(modules_dir))
+
+            from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+
+            self._audio_vae.to(self.device)
+            audio = vae_decode_audio(latents, self._audio_vae, None)
+            self._audio_vae.to("cpu")
+            return audio
+
+        except ImportError:
+            logger.warning("ltx_core not available for audio decode, returning raw latents")
+            return latents.squeeze(0).mean(dim=-1).float()
+
+
+class _ChunkedFFN(torch.nn.Module):
+    def __init__(self, ff: torch.nn.Module, chunk_size: int):
+        super().__init__()
+        self.ff = ff
+        self.chunk_size = chunk_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[1] <= self.chunk_size:
+            return self.ff(x)
+
+        chunks = []
+        for i in range(0, x.shape[1], self.chunk_size):
+            chunk = x[:, i:i + self.chunk_size, :]
+            chunks.append(self.ff(chunk))
+        return torch.cat(chunks, dim=1)
+
+
+class _StateDictVAE:
+    def __init__(self, state_dict: dict, device: torch.device, dtype: torch.dtype):
+        self.state_dict = {k: v.to(device=device, dtype=dtype) for k, v in state_dict.items()}
+        self.device = device
+        self.dtype = dtype

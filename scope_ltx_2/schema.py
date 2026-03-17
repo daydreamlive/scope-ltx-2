@@ -1,11 +1,10 @@
-"""LTX2 pipeline configuration schema."""
+"""LTX 2.3 pipeline configuration schema."""
 
 from typing import ClassVar
 
 from pydantic import Field
 
 from scope.core.pipelines.artifacts import HuggingfaceRepoArtifact
-from scope.core.pipelines.enums import Quantization
 from scope.core.pipelines.base_schema import (
     BasePipelineConfig,
     ModeDefaults,
@@ -14,36 +13,33 @@ from scope.core.pipelines.base_schema import (
 
 
 class LTX2Config(BasePipelineConfig):
-    """Configuration for LTX2 text-to-video pipeline.
+    """Configuration for LTX 2.3 audio-video generation pipeline.
 
-    LTX2 is a high-quality video generation model that generates videos from text prompts.
-    This is a non-autoregressive model that generates complete videos in one shot.
+    Uses Kijai's separated ComfyUI-format checkpoints (distilled v3 FP8).
+    FP8 quantization is baked into the transformer checkpoint, so no
+    quantization selection is needed.
 
-    Performance Optimization Options:
-    ---------------------------------
-    - **quantization**: "fp8" (~2x weight reduction), "nvfp4" (~4x, Blackwell only), or None
-    - **ffn_chunk_size**: Chunk FFN processing to reduce activation memory ~10x
-    - **offload_text_encoder**: Free ~25GB by offloading Gemma to CPU after encoding
-    - **blocks_to_stream**: Stream transformer blocks from CPU to save ~10-15GB
-    - **low_vram_init**: Build model on CPU to avoid OOM during initialization
+    Fits on a 24GB GPU with text encoder offloading enabled.
     """
 
-    # Pipeline metadata
     pipeline_id: ClassVar[str] = "ltx2"
-    pipeline_name: ClassVar[str] = "LTX2"
+    pipeline_name: ClassVar[str] = "LTX 2.3"
     pipeline_description: ClassVar[str] = (
-        "High-quality text-to-video generation with LTX2 transformer"
+        "High-quality audio-video generation with LTX 2.3 (22B distilled)"
     )
-    pipeline_version: ClassVar[str] = "0.2.0"
+    pipeline_version: ClassVar[str] = "0.3.0"
     docs_url: ClassVar[str | None] = "https://github.com/Lightricks/LTX-2"
-    estimated_vram_gb: ClassVar[float | None] = 32.0  # With optimizations enabled
+    estimated_vram_gb: ClassVar[float | None] = 22.0
     requires_models: ClassVar[bool] = True
+
     artifacts = [
         HuggingfaceRepoArtifact(
-            repo_id="Lightricks/LTX-2",
+            repo_id="Kijai/LTX2.3_comfy",
             files=[
-                "ltx-2-19b-distilled.safetensors",
-                "ltx-2-spatial-upscaler-x2-1.0.safetensors",
+                "diffusion_models/ltx-2.3-22b-distilled_transformer_only_fp8_input_scaled_v3.safetensors",
+                "text_encoders/ltx-2.3_text_projection_bf16.safetensors",
+                "vae/LTX23_video_vae_bf16.safetensors",
+                "vae/LTX23_audio_vae_bf16.safetensors",
             ],
         ),
         HuggingfaceRepoArtifact(
@@ -66,32 +62,19 @@ class LTX2Config(BasePipelineConfig):
             ],
         ),
     ]
+
     supports_lora: ClassVar[bool] = False
     supports_vace: ClassVar[bool] = False
-
-    # UI capability metadata
     supports_cache_management: ClassVar[bool] = False
     supports_kv_cache_bias: ClassVar[bool] = False
-    supports_quantization: ClassVar[bool] = True
+    supports_quantization: ClassVar[bool] = False
     min_dimension: ClassVar[int] = 64
     modified: ClassVar[bool] = False
-    recommended_quantization_vram_threshold: ClassVar[float | None] = 32.0
 
-    # NOTE: The following flags are NOT in scope main but are used by the branch:
-    # - supports_randomize_seed: ClassVar[bool] = True  # LTX2 is bidirectional
-    # - supports_num_frames: ClassVar[bool] = True  # LTX2 supports configurable frames
-    # These parameters still work via kwargs, just without UI controls in scope main.
-
-    # Mode configuration - only supports text mode for now
     modes: ClassVar[dict[str, ModeDefaults]] = {"text": ModeDefaults(default=True)}
-
-    # Prompt support
     supports_prompts: ClassVar[bool] = True
 
-    # Resolution settings (LTX2 works best at these resolutions)
-    # CRITICAL: Set to minimal values to fit in 96GB VRAM
-    # Activations during denoising are NOT quantized and scale with resolution×frames
-    # Even with FP8 weights, activations use 70+ GB at high settings
+    # Resolution
     height: int = Field(
         default=512,
         ge=1,
@@ -109,10 +92,7 @@ class LTX2Config(BasePipelineConfig):
         ),
     )
 
-    # Number of frames to generate
-    # LTX-2 VAE requires frame counts following 8K+1 (1, 9, 17, 25, 33, 41, 49, ...)
-    # The pipeline snaps to the nearest valid value at runtime.
-    # Memory formula: ~1.5GB per frame at 512x768 resolution
+    # LTX-2 VAE requires frame counts following 8K+1 (1, 9, 17, 25, 33, 41, ...)
     num_frames: int = Field(
         default=33,
         ge=9,
@@ -127,126 +107,27 @@ class LTX2Config(BasePipelineConfig):
         ),
     )
 
-    # Frame rate for video generation
     frame_rate: float = 24.0
 
-    # =========================================================================
-    # Quantization settings
-    # =========================================================================
-
-    # Memory optimization: Quantization for transformer weights
-    # - "fp8": ~2x memory reduction (requires SM >= 8.9 Ada)
-    # - "nvfp4": ~4x memory reduction (requires SM >= 10.0 Blackwell + comfy-kitchen)
-    # - None: Full precision BF16
-    # Requires PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-    quantization: Quantization | None = Field(
-        default=Quantization.FP8_E4M3FN,
-        description="Quantization method for the transformer model.",
-        json_schema_extra=ui_field_config(
-            order=8, component="quantization", is_load_param=True
-        ),
-    )
-
-    # Legacy backwards compatibility with use_fp8 field
-    use_fp8: bool | None = Field(
-        default=None,
-        description="Deprecated: Use 'quantization' field instead.",
-    )
-
-    # =========================================================================
-    # FFN Chunking
-    # =========================================================================
-
     # FFN chunking for memory-efficient inference
-    # FFN layers expand hidden dimensions by 4x, creating massive intermediate tensors.
-    # By processing the sequence in chunks, we reduce peak activation memory by ~10x.
-    # Set to None to disable chunking.
     ffn_chunk_size: int | None = Field(
         default=4096,
         description=(
             "Chunk size for FFN processing. Smaller values use less memory but "
-            "have more kernel launch overhead. Set to None to disable chunking. "
-            "Default 4096 reduces activation memory from ~50GB to ~5GB."
+            "have more kernel launch overhead. Set to None to disable chunking."
         ),
     )
 
-    # =========================================================================
-    # Text Encoder Offloading
-    # =========================================================================
-
-    # Offload text encoder to CPU after encoding
-    # The text encoder (Gemma 12B) uses ~25GB VRAM but is only needed once per prompt.
-    # Offloading it to CPU after encoding frees this memory for the transformer.
+    # Text encoder offloading
     offload_text_encoder: bool = Field(
         default=True,
         description=(
             "Offload text encoder to CPU after encoding prompts. "
-            "Saves ~25GB VRAM but adds latency when prompts change. "
-            "Recommended for GPUs with less than 48GB VRAM."
+            "Saves ~25GB VRAM but adds latency when prompts change."
         ),
     )
 
-    # =========================================================================
-    # Weight Streaming
-    # =========================================================================
-
-    # Weight streaming for low-VRAM inference
-    # Streams transformer blocks from CPU to GPU during forward pass.
-    # This enables running on GPUs with less VRAM at the cost of slower inference.
-    # Set to 0 to disable (keep all blocks on GPU).
-    # LTX-2 has 48 transformer blocks. Streaming 24 blocks saves ~10-15GB VRAM.
-    blocks_to_stream: int = Field(
-        default=0,
-        ge=0,
-        le=47,
-        description=(
-            "Number of transformer blocks to stream from CPU during inference. "
-            "Higher values save more VRAM but slow down inference. "
-            "LTX-2 has 48 blocks. Set to 24 to save ~10-15GB VRAM. "
-            "Set to 0 to disable streaming (fastest, highest VRAM)."
-        ),
-    )
-
-    # Prefetch blocks for weight streaming
-    # Number of blocks to prefetch ahead using async CUDA transfers.
-    # Higher values hide more transfer latency but use more GPU memory.
-    prefetch_blocks: int = Field(
-        default=1,
-        ge=0,
-        le=4,
-        description=(
-            "Number of blocks to prefetch ahead during weight streaming. "
-            "Higher values reduce latency but use more GPU memory. "
-            "Only applies when blocks_to_stream > 0."
-        ),
-    )
-
-    # =========================================================================
-    # Low-VRAM Initialization
-    # =========================================================================
-
-    # Force low-VRAM mode for initialization
-    # When enabled, uses streaming quantization which builds the transformer on CPU
-    # and quantizes layer-by-layer to minimize peak GPU memory during init.
-    # Automatically enabled when GPU has < 40GB free VRAM.
-    # Set to True to force this mode even on high-VRAM GPUs (for testing).
-    low_vram_init: bool = Field(
-        default=False,
-        description=(
-            "Force low-VRAM initialization mode. Uses streaming quantization "
-            "to keep peak GPU memory under 10GB during init. Slower but required "
-            "for GPUs with < 40GB VRAM. Auto-detected if not set."
-        ),
-    )
-
-    # =========================================================================
-    # Seed Randomization
-    # =========================================================================
-
-    # Randomize seed on every generation
-    # LTX2 is bidirectional (not autoregressive), so each chunk is independent.
-    # With a fixed seed, the same chunk is regenerated unless the prompt changes.
-    # Enable this to get varied outputs between chunks.
+    # Seed randomization
     randomize_seed: bool = Field(
         default=False,
         description="Randomize seed on every inference call for varied outputs between chunks",

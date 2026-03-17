@@ -1,11 +1,14 @@
 [project]
 name = "scope-ltx-2"
-version = "0.2.0"
-description = "LTX-2 plugin for Daydream Scope"
+version = "0.3.0"
+description = "LTX 2.3 audio-video generation plugin for Daydream Scope"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "torchaudio==2.9.1",
+    "safetensors",
+    "einops",
+    "transformers",
 ]
 
 [project.entry-points.scope]

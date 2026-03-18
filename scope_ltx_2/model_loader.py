@@ -6,14 +6,100 @@ safetensors files in the Kijai/LTX2.3_comfy format.
 
 import json
 import logging
+import types
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from safetensors.torch import load_file
 
 from .ltx_model import LTXAVModel
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# FP8 scaled linear patching
+# ---------------------------------------------------------------------------
+
+_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+
+def _fp8_scaled_forward(
+    self: nn.Linear,
+    input: torch.Tensor,
+) -> torch.Tensor:
+    """Forward pass using torch._scaled_mm for FP8 quantized weights.
+
+    The weight is stored in float8_e4m3fn with per-tensor input_scale and
+    weight_scale. We quantize the input to FP8 using the stored input_scale,
+    then use _scaled_mm for the matmul, and add bias in the output dtype.
+    """
+    weight_t = self.weight.data.t().contiguous()
+    input_scale: torch.Tensor = self._fp8_input_scale
+    weight_scale: torch.Tensor = self._fp8_weight_scale
+
+    orig_shape = input.shape
+    orig_dtype = input.dtype
+    if input.ndim > 2:
+        input = input.reshape(-1, orig_shape[-1])
+
+    dev = input.device
+    input_scale = input_scale.to(dev, non_blocking=True)
+    weight_scale = weight_scale.to(dev, non_blocking=True)
+
+    input_fp8 = (input.float() / input_scale).clamp(
+        -_FP8_MAX, _FP8_MAX,
+    ).to(torch.float8_e4m3fn).contiguous()
+
+    out = torch._scaled_mm(
+        input_fp8,
+        weight_t,
+        scale_a=input_scale,
+        scale_b=weight_scale,
+        out_dtype=orig_dtype,
+    )
+    if isinstance(out, tuple):
+        out = out[0]
+
+    if self.bias is not None:
+        out = out + self.bias.to(out.dtype)
+
+    if len(orig_shape) > 2:
+        out = out.view(*orig_shape[:-1], out.shape[-1])
+
+    return out
+
+
+def patch_fp8_layers(model: nn.Module, fp8_scales: dict[str, torch.Tensor]) -> int:
+    """Patch all linear layers with FP8 weights to use scaled matmul.
+
+    Finds every nn.Linear whose weight is float8_e4m3fn, looks up the
+    corresponding input_scale and weight_scale from fp8_scales, and
+    monkey-patches the forward method to use torch._scaled_mm.
+
+    Returns the number of layers patched.
+    """
+    patched = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if module.weight.dtype != torch.float8_e4m3fn:
+            continue
+
+        is_key = f"{name}.input_scale"
+        ws_key = f"{name}.weight_scale"
+        if is_key not in fp8_scales or ws_key not in fp8_scales:
+            logger.warning(f"FP8 layer {name} missing scales, skipping patch")
+            continue
+
+        module._fp8_input_scale = fp8_scales[is_key]
+        module._fp8_weight_scale = fp8_scales[ws_key]
+
+        module.forward = types.MethodType(_fp8_scaled_forward, module)
+        patched += 1
+
+    return patched
 
 
 def detect_config_from_state_dict(state_dict: dict, metadata: dict | None = None) -> dict:
@@ -175,8 +261,10 @@ def load_transformer(
     del model_weights
     torch.cuda.empty_cache()
 
-    # Keep on CPU — the pipeline moves it to GPU during denoising
-    # (after Gemma is offloaded) to fit within 24GB VRAM.
+    # Patch FP8 linear layers to use scaled matmul with proper scales
+    if fp8_scales:
+        patched = patch_fp8_layers(model, fp8_scales)
+        logger.info(f"Patched {patched} FP8 linear layers with scaled matmul")
     model._fp8_scales = fp8_scales
     del fp8_scales
 

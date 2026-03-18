@@ -43,22 +43,19 @@ class LTX2Config(BasePipelineConfig):
             ],
         ),
         HuggingfaceRepoArtifact(
+            repo_id="Comfy-Org/ltx-2",
+            files=[
+                "split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors",
+            ],
+        ),
+        HuggingfaceRepoArtifact(
             repo_id="google/gemma-3-12b-it",
             files=[
                 "config.json",
-                "generation_config.json",
-                "model-00001-of-00005.safetensors",
-                "model-00002-of-00005.safetensors",
-                "model-00003-of-00005.safetensors",
-                "model-00004-of-00005.safetensors",
-                "model-00005-of-00005.safetensors",
-                "model.safetensors.index.json",
-                "processor_config.json",
-                "preprocessor_config.json",
-                "special_tokens_map.json",
                 "tokenizer.json",
                 "tokenizer.model",
                 "tokenizer_config.json",
+                "special_tokens_map.json",
             ],
         ),
     ]
@@ -115,15 +112,6 @@ class LTX2Config(BasePipelineConfig):
         description=(
             "Chunk size for FFN processing. Smaller values use less memory but "
             "have more kernel launch overhead. Set to None to disable chunking."
-        ),
-    )
-
-    # Text encoder offloading
-    offload_text_encoder: bool = Field(
-        default=True,
-        description=(
-            "Offload text encoder to CPU after encoding prompts. "
-            "Saves ~25GB VRAM but adds latency when prompts change."
         ),
     )
 

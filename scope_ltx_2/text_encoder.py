@@ -152,13 +152,6 @@ def load_gemma_text_encoder(
     return model, tokenizer
 
 
-GEMMA3_CHAT_TEMPLATE = (
-    "<start_of_turn>\nsystem\nYou are a helpful assistant.<end_of_turn>\n"
-    "<start_of_turn>\nuser\n{}<end_of_turn>\n"
-    "<start_of_turn>\nmodel\n"
-)
-
-
 def _rescale_norm(x: torch.Tensor, target_dim: int, source_dim: int) -> torch.Tensor:
     return x * math.sqrt(target_dim / source_dim)
 
@@ -284,18 +277,16 @@ def encode_prompt(
 ) -> torch.Tensor:
     """Encode a text prompt using Gemma and return stacked hidden states.
 
-    Wraps the prompt in the Gemma3 IT chat template, tokenizes with left-padding,
-    then strips padding tokens so the output contains only real tokens. This matches
-    ComfyUI's encode_token_weights flow.
+    Tokenizes plain text (no chat template) with left-padding, then strips
+    padding tokens so the output contains only real tokens.  This matches
+    ComfyUI's encode_token_weights flow where raw text is fed directly.
 
     Returns:
         all_layer_hiddens: [B, T_real, D, L] hidden states from all transformer layers
                            with padding stripped (only real tokens).
     """
-    formatted_prompt = GEMMA3_CHAT_TEMPLATE.format(prompt)
-
     inputs = tokenizer(
-        formatted_prompt,
+        prompt.strip(),
         return_tensors="pt",
         padding="max_length",
         max_length=max_length,

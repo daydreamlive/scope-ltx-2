@@ -71,8 +71,6 @@ def _load_sd_with_prefix_replace(
 
 DISTILLED_SIGMA_VALUES = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
 
-AUDIO_SAMPLE_RATE = 24000
-
 
 def _log_gpu_memory(stage: str) -> None:
     if torch.cuda.is_available():
@@ -491,17 +489,17 @@ class LTX2Pipeline(Pipeline):
         video_tensor = self._decode_video(video_latents)
 
         logger.info("Decoding audio from latents...")
-        audio_tensor = self._decode_audio(audio_latents)
+        audio_tensor, audio_sample_rate = self._decode_audio(audio_latents)
 
         logger.info(
             f"Generated: video={video_tensor.shape}, audio={audio_tensor.shape}, "
-            f"duration={audio_tensor.shape[-1] / AUDIO_SAMPLE_RATE:.2f}s"
+            f"duration={audio_tensor.shape[-1] / audio_sample_rate:.2f}s @ {audio_sample_rate}Hz"
         )
 
         return {
             "video": video_tensor,
             "audio": audio_tensor,
-            "audio_sample_rate": AUDIO_SAMPLE_RATE,
+            "audio_sample_rate": audio_sample_rate,
             "frame_rate": frame_rate,
         }
 
@@ -677,7 +675,9 @@ class LTX2Pipeline(Pipeline):
             logger.info(
                 f"Step {i+1}/{len(sigmas)-1}: sigma={sigma:.4f}->{sigma_next:.4f} ({elapsed:.1f}s) | "
                 f"v_pred: mean={v_pred.mean().item():.4f} std={v_pred.std().item():.4f} | "
-                f"v_noisy: mean={v_noisy.mean().item():.4f} std={v_noisy.std().item():.4f} range=[{v_noisy.min().item():.2f},{v_noisy.max().item():.2f}]"
+                f"v_noisy: mean={v_noisy.mean().item():.4f} std={v_noisy.std().item():.4f} range=[{v_noisy.min().item():.2f},{v_noisy.max().item():.2f}] | "
+                f"a_pred: mean={a_pred.mean().item():.4f} std={a_pred.std().item():.4f} nan={a_pred.isnan().any().item()} | "
+                f"a_noisy: mean={a_noisy.mean().item():.4f} std={a_noisy.std().item():.4f} range=[{a_noisy.min().item():.2f},{a_noisy.max().item():.2f}]"
             )
 
         return v_noisy, a_noisy
@@ -711,17 +711,19 @@ class LTX2Pipeline(Pipeline):
                 torch.cuda.empty_cache()
         return video
 
-    def _decode_audio(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode audio latents following ComfyUI's AudioVAE.decode() exactly.
+    def _decode_audio(self, latents: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """Decode audio latents following ComfyUI's AudioVAE.decode() pattern.
 
-        Latents arrive as (B, C=8, T, F=16) from the denoiser.
-        1. Patchify:  (B, C, T, F) -> (B, T, C*F=128) so 128-dim stats broadcast
-        2. un_normalize in patch space
-        3. Unpatchify: (B, T, 128) -> (B, 8, T, 16)
-        4. Compute target_shape for decoder: (B, out_ch, T*4 - 3, mel_bins)
-        5. Decode to mel spectrogram
-        6. Transpose mel for vocoder: (B, C, T, F) -> (B, C, F, T), squeeze if mono
-        7. Run vocoder to get waveform
+        Returns (waveform, sample_rate) where sample_rate is the vocoder's
+        actual output rate (with BWE this is typically 48 kHz, not the base
+        VAE's 24 kHz).
+
+        Steps (matching ComfyUI AudioVAE.decode + run_vocoder):
+        1. Denormalize: patchify -> un_normalize -> unpatchify
+        2. Compute target_shape from original latent dimensions
+        3. Decoder forward -> mel spectrogram
+        4. Transpose mel for vocoder, squeeze if mono
+        5. Vocoder -> waveform
         """
         from einops import rearrange
 
@@ -732,15 +734,26 @@ class LTX2Pipeline(Pipeline):
             _move_module_to(self._audio_vae, self.device)
             _move_module_to(self._vocoder, self.device)
         try:
+            # Float32 for signal-processing precision (STFT, mel filterbank)
+            latents = latents.to(device=self.device, dtype=torch.float32)
+
             original_shape = latents.shape
             batch, channels, time, freq = original_shape
+            logger.info(
+                f"Audio decode input: shape={original_shape} "
+                f"mean={latents.mean().item():.4f} std={latents.std().item():.4f} "
+                f"range=[{latents.min().item():.2f},{latents.max().item():.2f}]"
+            )
 
+            # Denormalize: patchify -> un_normalize -> unpatchify
             patched = rearrange(latents, "b c t f -> b t (c f)")
             denormalized = self._audio_vae.per_channel_statistics.un_normalize(patched)
             latents = rearrange(denormalized, "b t (c f) -> b c t f", c=channels, f=freq)
 
+            # Target shape (ComfyUI AudioVAE.target_shape_from_latents)
+            from .comfy_vae.audio_vae import CausalityAxis
             target_length = time * LATENT_DOWNSAMPLE_FACTOR
-            if self._audio_vae.is_causal:
+            if self._audio_vae.causality_axis != CausalityAxis.NONE:
                 target_length -= LATENT_DOWNSAMPLE_FACTOR - 1
             target_shape = (
                 batch,
@@ -750,20 +763,48 @@ class LTX2Pipeline(Pipeline):
             )
 
             mel_spec = self._audio_vae.decode(latents, target_shape=target_shape)
+            logger.info(
+                f"Audio mel_spec: shape={mel_spec.shape} "
+                f"mean={mel_spec.mean().item():.4f} std={mel_spec.std().item():.4f}"
+            )
 
+            # Run vocoder (ComfyUI AudioVAE.run_vocoder)
             audio_channels = self._audio_vae.decoder.out_ch
             vocoder_input = mel_spec.transpose(2, 3)
             if audio_channels == 1:
                 vocoder_input = vocoder_input.squeeze(1)
+            elif audio_channels != 2:
+                raise ValueError(f"Unsupported audio_channels: {audio_channels}")
 
-            audio = self._vocoder(vocoder_input).squeeze(0).float()
+            waveform = self._vocoder(vocoder_input)
+            logger.info(
+                f"Audio waveform: shape={waveform.shape} "
+                f"mean={waveform.mean().item():.4f} std={waveform.std().item():.4f} "
+                f"range=[{waveform.min().item():.2f},{waveform.max().item():.2f}]"
+            )
+
+            audio = waveform.squeeze(0).float()
         finally:
             if need_move:
                 _move_module_to(self._audio_vae, "cpu")
                 _move_module_to(self._vocoder, "cpu")
                 gc.collect()
                 torch.cuda.empty_cache()
-        return audio
+
+        # Output sample rate from vocoder (ComfyUI AudioVAE.output_sample_rate)
+        output_rate = getattr(self._vocoder, "output_sample_rate", None)
+        if output_rate is not None:
+            sample_rate = int(output_rate)
+        else:
+            upsample_factor = getattr(self._vocoder, "upsample_factor", None)
+            if upsample_factor is not None:
+                sample_rate = int(
+                    self._audio_vae.sampling_rate * upsample_factor / self._audio_vae.mel_hop_length
+                )
+            else:
+                sample_rate = int(self._audio_vae.sampling_rate)
+        logger.info(f"Audio output: {audio.shape}, sample_rate={sample_rate}Hz")
+        return audio, sample_rate
 
 
 class _ChunkedFFN(torch.nn.Module):

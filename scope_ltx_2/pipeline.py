@@ -6,10 +6,15 @@ a standalone inference implementation adapted from ComfyUI's lightricks code.
 Memory Management (24GB GPU):
     - Gemma 3 12B FP8 text encoder: ~13GB on GPU, offloaded after encoding
     - Text projection (aggregate embeds): ~1.5GB, runs on GPU briefly
-    - Transformer (22B FP8): ~23GB total, CPU-resident. Non-attention layers
-      stay on GPU (~7.5GB), transformer blocks streamed one at a time from CPU.
-    - VAEs: moved to GPU only during decode
-    - Mirrors ComfyUI's --lowvram approach
+    - Transformer (22B FP8): ~23GB total, CPU-resident. Scaffold (norms,
+      embeddings, etc.) persists on GPU; transformer blocks streamed from
+      CPU with double-buffered async transfers and prefetching.
+    - VAEs: kept resident on GPU (~1GB total). The streaming config
+      automatically accounts for their memory at setup time.
+    - Between generations: streaming state (hooks, pinned memory) persists.
+      Resident blocks are temporarily offloaded for VAE decode, then
+      reloaded by pre-forward hooks on the next denoising pass.
+    - Full teardown only when text encoder needs to reload (prompt change).
 
 Audio Support:
     LTX 2.3 natively supports synchronized audio-video generation.
@@ -192,6 +197,7 @@ class LTX2Pipeline(Pipeline):
         self._cached_prompt_text = None
         self._cached_context = None
         self._streaming_state = None
+        self._vaes_on_gpu = False
 
         logger.info(f"LTX 2.3 pipeline loaded in {time.time() - start:.1f}s")
         _log_gpu_memory("all loaded")
@@ -226,6 +232,35 @@ class LTX2Pipeline(Pipeline):
         self._text_encoder_on_gpu = True
         _log_gpu_memory("gemma reloaded")
 
+    def _move_vaes_to_gpu(self):
+        """Move all VAE models to GPU and keep them resident.
+
+        Called before denoising setup so that calculate_optimal_streaming_config
+        sees the VAE memory as already allocated and reserves fewer resident
+        transformer blocks accordingly.
+        """
+        if self._vaes_on_gpu:
+            return
+        logger.info("Moving VAEs to GPU (will remain resident)...")
+        _move_module_to(self._video_vae, self.device)
+        _move_module_to(self._audio_vae, self.device)
+        _move_module_to(self._vocoder, self.device)
+        self._vaes_on_gpu = True
+        _log_gpu_memory("VAEs on GPU")
+
+    def _offload_vaes(self):
+        """Offload all VAE models to CPU to free VRAM for text encoder."""
+        if not self._vaes_on_gpu:
+            return
+        logger.info("Offloading VAEs to CPU...")
+        _move_module_to(self._video_vae, "cpu")
+        _move_module_to(self._audio_vae, "cpu")
+        _move_module_to(self._vocoder, "cpu")
+        self._vaes_on_gpu = False
+        gc.collect()
+        torch.cuda.empty_cache()
+        _log_gpu_memory("VAEs offloaded")
+
     def _load_video_vae(self, checkpoint_path: str, dtype: torch.dtype):
         """Load video VAE using ComfyUI-compatible VideoVAE architecture.
 
@@ -252,36 +287,41 @@ class LTX2Pipeline(Pipeline):
         return vae
 
     def _load_audio_vae(self, checkpoint_path: str, dtype: torch.dtype):
-        """Load audio VAE + vocoder using ComfyUI-compatible architectures.
+        """Load audio VAE + vocoder following ComfyUI's AudioVAE pattern.
+
+        Matches the loading strategy from ComfyUI's AudioVAE.__init__:
+        - No dtype casting during load (preserves float32 precision)
+        - No assign=True (copies values into float32-initialized parameters)
+        - Signal processing buffers (STFT basis, mel filterbank) stay float32
 
         Kijai's checkpoint keys:
           audio_vae.encoder.*, audio_vae.decoder.*, audio_vae.per_channel_statistics.*
           vocoder.vocoder.*, vocoder.bwe_generator.*, vocoder.mel_stft.*, vocoder.resampler.*
         """
         from safetensors import safe_open
-        from .comfy_vae import CausalAudioAutoencoder, VocoderWithBWE
+        from .comfy_vae import CausalAudioAutoencoder, Vocoder, VocoderWithBWE
 
         with safe_open(checkpoint_path, framework="pt") as f:
             config = json.loads(f.metadata()["config"])
 
-        # Audio VAE
+        # Audio VAE — load without dtype/assign to keep float32 precision
         audio_vae_config = config.get("audio_vae", config)
         audio_vae = CausalAudioAutoencoder(config=audio_vae_config)
-        sd = _load_sd_with_prefix_replace(checkpoint_path, {
-            "audio_vae.": "",
-        }, dtype=dtype)
-        audio_vae.load_state_dict(sd, strict=False, assign=True)
-        audio_vae = audio_vae.to(device="cpu", dtype=dtype).eval()
+        sd = _load_sd_with_prefix_replace(checkpoint_path, {"audio_vae.": ""})
+        audio_vae.load_state_dict(sd, strict=False)
+        audio_vae = audio_vae.to(device="cpu").eval()
         logger.info(f"Audio VAE loaded: {sum(p.numel() for p in audio_vae.parameters())/1e6:.1f}M params")
 
-        # Vocoder (with BWE)
+        # Vocoder — load without dtype/assign (STFT basis and mel filterbank
+        # need float32 precision for correct mel spectrogram computation)
         vocoder_config = config.get("vocoder", {})
-        vocoder = VocoderWithBWE(config=vocoder_config)
-        sd = _load_sd_with_prefix_replace(checkpoint_path, {
-            "vocoder.": "",
-        }, dtype=dtype)
-        vocoder.load_state_dict(sd, strict=False, assign=True)
-        vocoder = vocoder.to(device="cpu", dtype=dtype).eval()
+        if "bwe" in vocoder_config:
+            vocoder = VocoderWithBWE(config=vocoder_config)
+        else:
+            vocoder = Vocoder(config=vocoder_config)
+        sd = _load_sd_with_prefix_replace(checkpoint_path, {"vocoder.": ""})
+        vocoder.load_state_dict(sd, strict=False)
+        vocoder = vocoder.to(device="cpu").eval()
         logger.info(f"Vocoder loaded: {sum(p.numel() for p in vocoder.parameters())/1e6:.1f}M params")
 
         return audio_vae, vocoder
@@ -365,8 +405,9 @@ class LTX2Pipeline(Pipeline):
         else:
             logger.info(f"Encoding prompt: {prompt_text[:80]}...")
 
-            # Gemma needs ~13 GB — offload blocks/scaffold first if loaded
+            # Gemma needs ~13 GB — free everything else first
             self._teardown_denoising()
+            self._offload_vaes()
 
             self._load_text_encoder()
 
@@ -399,6 +440,10 @@ class LTX2Pipeline(Pipeline):
             self._cached_context = context
             _log_gpu_memory("text encoding complete")
 
+        # Move VAEs to GPU before denoising setup so the streaming config
+        # accounts for their memory in the available VRAM budget.
+        self._move_vaes_to_gpu()
+
         # =================================================================
         # Prepare latent noise
         # =================================================================
@@ -428,14 +473,16 @@ class LTX2Pipeline(Pipeline):
         logger.info(f"Denoising {num_frames} frames at {height}x{width} ({len(sigmas)-1} steps)")
 
         self._ensure_denoising_ready()
+        self._reload_resident_blocks()
 
         video_latents, audio_latents = self._euler_denoise(
             video_latents, audio_latents, context, sigmas, frame_rate,
         )
 
-        # Free transformer VRAM for VAE decode — _ensure_denoising_ready()
-        # will reload on the next generation call.
-        self._teardown_denoising()
+        # Offload resident blocks to free VRAM for VAE decode.
+        # Streaming state (hooks, pinned memory, scaffold) persists — resident
+        # blocks will be reloaded by pre-forward hooks on the next denoising pass.
+        self._free_blocks_for_decode()
 
         # =================================================================
         # VAE decode
@@ -526,6 +573,66 @@ class LTX2Pipeline(Pipeline):
         )
         self._streaming_state = None
 
+    def _reload_resident_blocks(self):
+        """Reload resident blocks to GPU after they were offloaded for VAE decode.
+
+        Called before denoising to ensure all resident blocks are on GPU.
+        Uses pinned memory from _free_blocks_for_decode for fast transfers.
+        """
+        if self._streaming_state is None:
+            return
+        state = self._streaming_state
+        device = state.config.compute_device
+        reloaded = 0
+        for i in range(state.streaming_start_idx):
+            if state.block_on_gpu[i]:
+                continue
+            block = state.blocks[i]
+            for param in block.parameters():
+                if param.device != device:
+                    param.data = param.data.to(device, non_blocking=True)
+            for buf in block.buffers():
+                if buf.device != device:
+                    buf.data = buf.data.to(device, non_blocking=True)
+            state.block_on_gpu[i] = True
+            reloaded += 1
+        if reloaded > 0 and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            _log_gpu_memory(f"reloaded {reloaded} resident blocks")
+
+    def _free_blocks_for_decode(self):
+        """Offload resident transformer blocks to free VRAM for VAE decode.
+
+        Streaming state (hooks, pinned memory) remains intact. Resident
+        blocks are pinned on first call for fast async transfers;
+        subsequent calls just restore the pinned CPU pointers.
+        _reload_resident_blocks() loads them back before the next denoising pass.
+        """
+        if self._streaming_state is None:
+            return
+        state = self._streaming_state
+        offloaded = 0
+        for i in range(state.streaming_start_idx):
+            if not state.block_on_gpu[i]:
+                continue
+            if state._pinned_params[i]:
+                block = state.blocks[i]
+                for name, param in block.named_parameters():
+                    if name in state._pinned_params[i]:
+                        param.data = state._pinned_params[i][name]
+                for buf in block.buffers():
+                    if buf.device.type != "cpu":
+                        buf.data = buf.data.to("cpu", non_blocking=True)
+            else:
+                state.pin_block(i)
+            state.block_on_gpu[i] = False
+            offloaded += 1
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        _log_gpu_memory(f"{offloaded} resident blocks offloaded for VAE decode")
+
     def _euler_denoise(
         self,
         video_latents: torch.Tensor,
@@ -585,7 +692,9 @@ class LTX2Pipeline(Pipeline):
         VideoVAE.decode() handles per-channel un-normalization internally.
         Output is in [-1, 1] range, we convert to [0, 1] and rearrange to (F, H, W, C).
         """
-        _move_module_to(self._video_vae, self.device)
+        need_move = not self._vaes_on_gpu
+        if need_move:
+            _move_module_to(self._video_vae, self.device)
         try:
             logger.info(f"VAE input: shape={latents.shape} mean={latents.mean().item():.4f} std={latents.std().item():.4f} range=[{latents.min().item():.2f},{latents.max().item():.2f}]")
             decoded = self._video_vae.decode(latents)
@@ -596,9 +705,10 @@ class LTX2Pipeline(Pipeline):
             video = video.permute(1, 2, 3, 0)
             logger.info(f"Video output: shape={video.shape} mean={video.mean().item():.4f} range=[{video.min().item():.2f},{video.max().item():.2f}]")
         finally:
-            _move_module_to(self._video_vae, "cpu")
-            gc.collect()
-            torch.cuda.empty_cache()
+            if need_move:
+                _move_module_to(self._video_vae, "cpu")
+                gc.collect()
+                torch.cuda.empty_cache()
         return video
 
     def _decode_audio(self, latents: torch.Tensor) -> torch.Tensor:
@@ -617,8 +727,10 @@ class LTX2Pipeline(Pipeline):
 
         LATENT_DOWNSAMPLE_FACTOR = 4
 
-        _move_module_to(self._audio_vae, self.device)
-        _move_module_to(self._vocoder, self.device)
+        need_move = not self._vaes_on_gpu
+        if need_move:
+            _move_module_to(self._audio_vae, self.device)
+            _move_module_to(self._vocoder, self.device)
         try:
             original_shape = latents.shape
             batch, channels, time, freq = original_shape
@@ -646,10 +758,11 @@ class LTX2Pipeline(Pipeline):
 
             audio = self._vocoder(vocoder_input).squeeze(0).float()
         finally:
-            _move_module_to(self._audio_vae, "cpu")
-            _move_module_to(self._vocoder, "cpu")
-            gc.collect()
-            torch.cuda.empty_cache()
+            if need_move:
+                _move_module_to(self._audio_vae, "cpu")
+                _move_module_to(self._vocoder, "cpu")
+                gc.collect()
+                torch.cuda.empty_cache()
         return audio
 
 

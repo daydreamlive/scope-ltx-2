@@ -78,27 +78,36 @@ def patch_fp8_layers(model: nn.Module, fp8_scales: dict[str, torch.Tensor]) -> i
     corresponding input_scale and weight_scale from fp8_scales, and
     monkey-patches the forward method to use torch._scaled_mm.
 
+    If input_scale is absent (e.g. Comfy-Org Gemma FP8 checkpoints),
+    defaults to 1.0 — matching ComfyUI's fp8_linear which clamps input
+    to FP8 range and casts directly without prescaling.
+
     Returns the number of layers patched.
     """
+    _default_input_scale = torch.tensor(1.0, dtype=torch.float32)
     patched = 0
+    skipped = 0
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
         if module.weight.dtype != torch.float8_e4m3fn:
             continue
 
-        is_key = f"{name}.input_scale"
         ws_key = f"{name}.weight_scale"
-        if is_key not in fp8_scales or ws_key not in fp8_scales:
-            logger.warning(f"FP8 layer {name} missing scales, skipping patch")
+        if ws_key not in fp8_scales:
+            logger.warning(f"FP8 layer {name} missing weight_scale, skipping patch")
+            skipped += 1
             continue
 
-        module._fp8_input_scale = fp8_scales[is_key]
+        is_key = f"{name}.input_scale"
+        module._fp8_input_scale = fp8_scales.get(is_key, _default_input_scale)
         module._fp8_weight_scale = fp8_scales[ws_key]
 
         module.forward = types.MethodType(_fp8_scaled_forward, module)
         patched += 1
 
+    if skipped:
+        logger.warning(f"{skipped} FP8 layers skipped (missing weight_scale)")
     return patched
 
 

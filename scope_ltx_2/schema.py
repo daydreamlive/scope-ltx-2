@@ -60,6 +60,7 @@ class LTX2Config(BasePipelineConfig):
         ),
     ]
 
+    produces_audio: ClassVar[bool] = True
     supports_lora: ClassVar[bool] = False
     supports_vace: ClassVar[bool] = False
     supports_cache_management: ClassVar[bool] = False

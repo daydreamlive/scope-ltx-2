@@ -70,22 +70,24 @@ def load_gemma_text_encoder(
 
         fp8_sd = load_file(str(gemma_model_path), device="cpu")
 
-        # Strip FP8 scale/quant metadata and non-language keys
-        fp8_suffixes = (".weight_scale", ".input_scale", ".comfy_quant")
+        # Separate FP8 scale metadata from model weights (keep scales for patching)
+        fp8_scale_suffixes = (".weight_scale", ".input_scale")
         skip_prefixes = ("vision_model.", "multi_modal_projector.")
+        fp8_scales = {}
         model_weights = {}
-        n_scales = 0
         n_skipped = 0
         for k, v in fp8_sd.items():
-            if any(k.endswith(s) for s in fp8_suffixes):
-                n_scales += 1
-            elif any(k.startswith(p) for p in skip_prefixes) or k == "spiece_model":
+            if any(k.startswith(p) for p in skip_prefixes) or k == "spiece_model":
                 n_skipped += 1
+            elif any(k.endswith(s) for s in fp8_scale_suffixes):
+                fp8_scales[k] = v
+            elif k.endswith(".comfy_quant"):
+                pass
             else:
                 model_weights[k] = v
         del fp8_sd
 
-        logger.info(f"Stripped {n_scales} FP8 scale/quant keys, skipped {n_skipped} vision/multi_modal keys")
+        logger.info(f"Separated {len(fp8_scales)} FP8 scale keys, skipped {n_skipped} vision/multi_modal keys")
 
         missing, unexpected = model.load_state_dict(model_weights, strict=False, assign=True)
         del model_weights
@@ -119,6 +121,13 @@ def load_gemma_text_encoder(
             parent.register_buffer(attr, new_buf)
             logger.info(f"Initialized meta buffer: {name}")
 
+        # Patch FP8 linear layers with scaled matmul (same approach as transformer)
+        if fp8_scales:
+            from .model_loader import patch_fp8_layers
+            patched = patch_fp8_layers(model, fp8_scales)
+            logger.info(f"Patched {patched} Gemma FP8 linear layers with scaled matmul")
+        del fp8_scales
+
         # Move to device preserving dtypes (FP8 stays FP8)
         for param in model.parameters():
             param.data = param.data.to(device=device)
@@ -143,30 +152,34 @@ def load_gemma_text_encoder(
     return model, tokenizer
 
 
+GEMMA3_CHAT_TEMPLATE = (
+    "<start_of_turn>\nsystem\nYou are a helpful assistant.<end_of_turn>\n"
+    "<start_of_turn>\nuser\n{}<end_of_turn>\n"
+    "<start_of_turn>\nmodel\n"
+)
+
+
 def _rescale_norm(x: torch.Tensor, target_dim: int, source_dim: int) -> torch.Tensor:
     return x * math.sqrt(target_dim / source_dim)
 
 
 def _norm_and_concat_per_token_rms(
     encoded_text: torch.Tensor,
-    attention_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Per-token RMSNorm over the hidden dim, then flatten layers.
 
+    Padding tokens must be stripped BEFORE calling this function.
+
     Args:
         encoded_text: [B, T, D, L] -- hidden states stacked across L layers
-        attention_mask: [B, T] binary mask (1=real, 0=pad)
+                      (only real tokens, no padding)
 
     Returns:
-        [B, T, D*L] normalized and flattened tensor with padding zeroed out.
+        [B, T, D*L] normalized and flattened tensor.
     """
-    B, T, D, L = encoded_text.shape
-    variance = torch.mean(encoded_text ** 2, dim=2, keepdim=True)
-    normed = encoded_text * torch.rsqrt(variance + 1e-6)
-    normed = normed.reshape(B, T, D * L)
-    mask_3d = attention_mask.bool().unsqueeze(-1)
-    normed = torch.where(mask_3d, normed, torch.zeros_like(normed))
-    return normed
+    x = encoded_text
+    x = x * torch.rsqrt(torch.mean(x ** 2, dim=2, keepdim=True) + 1e-6)
+    return x.flatten(start_dim=2)
 
 
 class TextEmbeddingProjection(nn.Module):
@@ -231,18 +244,19 @@ class TextEmbeddingProjection(nn.Module):
     def forward(
         self,
         all_layer_hiddens: torch.Tensor,
-        attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Project Gemma hidden states to video+audio context.
 
+        Padding tokens must be stripped before calling this method.
+
         Args:
             all_layer_hiddens: [B, T, D, L] stacked hidden states from all layers
-            attention_mask: [B, T] binary mask
+                               (only real tokens, no padding)
 
         Returns:
             [B, T, video_dim + audio_dim] concatenated context
         """
-        normed = _norm_and_concat_per_token_rms(all_layer_hiddens, attention_mask)
+        normed = _norm_and_concat_per_token_rms(all_layer_hiddens)
         normed = normed.to(self.video_aggregate_embed.weight.dtype)
 
         v_dim = self.video_aggregate_embed.out_features
@@ -267,15 +281,21 @@ def encode_prompt(
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
     max_length: int = 512,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Encode a text prompt using Gemma and return stacked hidden states.
 
+    Wraps the prompt in the Gemma3 IT chat template, tokenizes with left-padding,
+    then strips padding tokens so the output contains only real tokens. This matches
+    ComfyUI's encode_token_weights flow.
+
     Returns:
-        all_layer_hiddens: [B, T, D, L] hidden states from all transformer layers
-        attention_mask: [B, T] binary mask
+        all_layer_hiddens: [B, T_real, D, L] hidden states from all transformer layers
+                           with padding stripped (only real tokens).
     """
+    formatted_prompt = GEMMA3_CHAT_TEMPLATE.format(prompt)
+
     inputs = tokenizer(
-        prompt,
+        formatted_prompt,
         return_tensors="pt",
         padding="max_length",
         max_length=max_length,
@@ -293,11 +313,16 @@ def encode_prompt(
     # aggregate_embed input dim of 188160 = 3840 * 49.
     all_layer_hiddens = torch.stack(list(outputs.hidden_states), dim=-1).to(dtype=dtype)
 
+    # Strip left-padding tokens: only keep real tokens.
+    # With left-padding, real tokens are at the END of the sequence.
     attention_mask = inputs["attention_mask"]
+    real_token_count = int(attention_mask.sum().item())
+    all_layer_hiddens = all_layer_hiddens[:, -real_token_count:, :, :]
 
     logger.info(
         f"Encoded prompt: {all_layer_hiddens.shape[3]} layers, "
-        f"dim={all_layer_hiddens.shape[2]}, seq_len={all_layer_hiddens.shape[1]}"
+        f"dim={all_layer_hiddens.shape[2]}, "
+        f"seq_len={all_layer_hiddens.shape[1]} (stripped from {attention_mask.shape[1]})"
     )
 
-    return all_layer_hiddens, attention_mask
+    return all_layer_hiddens

@@ -370,7 +370,7 @@ class LTX2Pipeline(Pipeline):
 
             self._load_text_encoder()
 
-            all_layer_hiddens, attention_mask = encode_prompt(
+            all_layer_hiddens = encode_prompt(
                 self._text_encoder,
                 self._tokenizer,
                 prompt_text,
@@ -382,9 +382,9 @@ class LTX2Pipeline(Pipeline):
             self._offload_text_encoder()
 
             self._text_projection.to(self.device)
-            projected = self._text_projection(all_layer_hiddens, attention_mask)
+            projected = self._text_projection(all_layer_hiddens)
             self._text_projection.to("cpu")
-            del all_layer_hiddens, attention_mask
+            del all_layer_hiddens
             logger.info(f"Text projection done: {projected.shape}")
 
             self._move_connectors_to_gpu()
@@ -433,8 +433,9 @@ class LTX2Pipeline(Pipeline):
             video_latents, audio_latents, context, sigmas, frame_rate,
         )
 
-        # Scaffold + blocks stay on GPU for the next generation.
-        # VAEs are small enough to coexist (~0.5 GB each).
+        # Free transformer VRAM for VAE decode — _ensure_denoising_ready()
+        # will reload on the next generation call.
+        self._teardown_denoising()
 
         # =================================================================
         # VAE decode

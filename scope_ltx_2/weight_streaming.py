@@ -259,26 +259,57 @@ def estimate_block_memory(block: nn.Module) -> int:
 def calculate_optimal_streaming_config(
     blocks: nn.ModuleList,
     available_vram_gb: float,
-    safety_margin_gb: float = 2.0,
+    safety_margin_gb: float = 1.5,
     min_resident_blocks: int = 4,
 ) -> BlockStreamingConfig:
     num_blocks = len(blocks)
     if num_blocks == 0:
         return BlockStreamingConfig(blocks_to_stream=0)
 
-    block_memory_gb = estimate_block_memory(blocks[0]) / 1024**3
-    usable_vram = available_vram_gb - safety_margin_gb
-    max_resident = int(usable_vram / block_memory_gb)
-    max_resident = max(min_resident_blocks, min(max_resident, num_blocks))
+    prefetch_blocks = 2
+
+    block_sizes = [estimate_block_memory(b) for b in blocks]
+    budget_bytes = (available_vram_gb - safety_margin_gb) * 1024**3
+
+    if sum(block_sizes) <= budget_bytes:
+        logger.info(f"All {num_blocks} blocks fit on GPU ({sum(block_sizes)/1024**3:.1f} GB), no streaming")
+        return BlockStreamingConfig(blocks_to_stream=0, prefetch_blocks=prefetch_blocks)
+
+    # During the forward pass, up to (prefetch + 1) streaming blocks may be on
+    # GPU concurrently (current block + prefetch slots), plus 1 extra to account
+    # for async offload latency before the previous block's memory is reclaimed.
+    peak_concurrent_streaming = prefetch_blocks + 2
+
+    # Find the maximum number of resident blocks such that
+    # resident_mem + peak_streaming_mem fits within the budget.
+    # Streaming blocks are the tail of the list; peak streaming memory is
+    # the sum of the largest `peak_concurrent_streaming` blocks in that tail.
+    max_resident = min_resident_blocks
+    for n in range(num_blocks, min_resident_blocks - 1, -1):
+        resident_mem = sum(block_sizes[:n])
+        streaming_tail = block_sizes[n:]
+        if not streaming_tail:
+            peak_streaming = 0
+        else:
+            concurrent = min(peak_concurrent_streaming, len(streaming_tail))
+            peak_streaming = sum(sorted(streaming_tail, reverse=True)[:concurrent])
+        if resident_mem + peak_streaming <= budget_bytes:
+            max_resident = n
+            break
+
     blocks_to_stream = num_blocks - max_resident
 
+    resident_gb = sum(block_sizes[:max_resident]) / 1024**3
+    stream_gb = sum(block_sizes[max_resident:]) / 1024**3
     logger.info(
-        f"Streaming config: {block_memory_gb:.2f} GB/block, "
-        f"{max_resident} resident, {blocks_to_stream} streaming"
+        f"Streaming config: {num_blocks} blocks, "
+        f"{max_resident} resident ({resident_gb:.1f} GB), "
+        f"{blocks_to_stream} streaming ({stream_gb:.1f} GB), "
+        f"budget={budget_bytes/1024**3:.1f} GB (safety={safety_margin_gb} GB)"
     )
 
     return BlockStreamingConfig(
         blocks_to_stream=blocks_to_stream,
-        prefetch_blocks=2,
+        prefetch_blocks=prefetch_blocks,
         use_pinned_memory=True,
     )

@@ -488,7 +488,7 @@ class LTX2Pipeline(Pipeline):
         config = calculate_optimal_streaming_config(
             blocks,
             available_vram_gb=available_gb,
-            safety_margin_gb=2.5,
+            safety_margin_gb=1.5,
             min_resident_blocks=4,
         )
         config.compute_device = self.device
@@ -520,7 +520,7 @@ class LTX2Pipeline(Pipeline):
         v_noisy = video_latents * sigmas[0]
         a_noisy = audio_latents * sigmas[0]
 
-        self._streaming_state = None
+        self._cleanup_block_streaming()
         self._setup_block_streaming()
 
         for i in range(len(sigmas) - 1):
@@ -653,5 +653,3 @@ class _ChunkedFFN(torch.nn.Module):
         for i in range(0, x.shape[1], self.chunk_size):
             chunks.append(self.ff(x[:, i:i + self.chunk_size, :]))
         return torch.cat(chunks, dim=1)
-
-

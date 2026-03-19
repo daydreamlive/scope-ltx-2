@@ -78,6 +78,8 @@ class LTX2Config(BasePipelineConfig):
     # Prompt support
     supports_prompts: ClassVar[bool] = True
 
+    produces_audio: ClassVar[bool] = False
+
     # Resolution settings (LTX2 works best at these resolutions)
     # CRITICAL: Set to minimal values to fit in 96GB VRAM
     # Activations during denoising are NOT quantized and scale with resolution×frames

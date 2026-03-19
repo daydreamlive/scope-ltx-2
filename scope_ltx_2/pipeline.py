@@ -293,6 +293,46 @@ class LTX2Pipeline(Pipeline):
     def __call__(self, **kwargs) -> dict:
         return self._generate(**kwargs)
 
+    def _ensure_denoising_ready(self):
+        """Ensure scaffold and block streaming are set up on GPU.
+
+        Keeps state persistent across generations — only the first call
+        pays the setup cost. Subsequent calls are a no-op.
+        """
+        if self._streaming_state is not None:
+            return
+
+        self._move_transformer_scaffold_to_gpu()
+        _log_gpu_memory("transformer scaffold on GPU")
+
+        from scope_ltx_2.weight_streaming import (
+            calculate_optimal_streaming_config,
+            setup_block_streaming,
+        )
+
+        blocks = self._transformer.transformer_blocks
+        free_mem, total_mem = torch.cuda.mem_get_info(self.device)
+        allocated = torch.cuda.memory_allocated(self.device)
+        available_gb = (total_mem - allocated) / 1024**3
+
+        config = calculate_optimal_streaming_config(
+            blocks,
+            available_vram_gb=available_gb,
+            safety_margin_gb=1.5,
+            min_resident_blocks=4,
+        )
+        config.compute_device = self.device
+
+        self._streaming_state = setup_block_streaming(blocks, config)
+        _log_gpu_memory("block streaming setup")
+
+    def _teardown_denoising(self):
+        """Offload all blocks and scaffold to CPU to free GPU for other models."""
+        self._cleanup_block_streaming()
+        self._move_transformer_scaffold_to_cpu()
+        gc.collect()
+        torch.cuda.empty_cache()
+
     @torch.inference_mode()
     def _generate(self, **kwargs) -> dict:
         from .text_encoder import encode_prompt
@@ -325,6 +365,9 @@ class LTX2Pipeline(Pipeline):
         else:
             logger.info(f"Encoding prompt: {prompt_text[:80]}...")
 
+            # Gemma needs ~13 GB — offload blocks/scaffold first if loaded
+            self._teardown_denoising()
+
             self._load_text_encoder()
 
             all_layer_hiddens, attention_mask = encode_prompt(
@@ -336,17 +379,14 @@ class LTX2Pipeline(Pipeline):
             )
             logger.info(f"Gemma encoding done: {all_layer_hiddens.shape}")
 
-            # Offload Gemma before loading transformer
             self._offload_text_encoder()
 
-            # Text projection on GPU (small, ~1.5GB)
             self._text_projection.to(self.device)
             projected = self._text_projection(all_layer_hiddens, attention_mask)
             self._text_projection.to("cpu")
             del all_layer_hiddens, attention_mask
             logger.info(f"Text projection done: {projected.shape}")
 
-            # Embedding connectors need the transformer's connector submodules on GPU
             self._move_connectors_to_gpu()
             context = self._transformer.preprocess_text_embeds(projected, unprocessed=True)
             self._move_connectors_to_cpu()
@@ -382,22 +422,19 @@ class LTX2Pipeline(Pipeline):
         )
 
         # =================================================================
-        # 8-step Euler denoising (transformer streamed from CPU)
+        # 8-step Euler denoising
         # =================================================================
         sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=self.device, dtype=self.dtype)
         logger.info(f"Denoising {num_frames} frames at {height}x{width} ({len(sigmas)-1} steps)")
 
-        # Move non-block components to GPU (small: adaln, patchify, proj_out, etc.)
-        self._move_transformer_scaffold_to_gpu()
-        _log_gpu_memory("transformer scaffold on GPU")
+        self._ensure_denoising_ready()
 
         video_latents, audio_latents = self._euler_denoise(
             video_latents, audio_latents, context, sigmas, frame_rate,
         )
 
-        self._move_transformer_scaffold_to_cpu()
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Scaffold + blocks stay on GPU for the next generation.
+        # VAEs are small enough to coexist (~0.5 GB each).
 
         # =================================================================
         # VAE decode
@@ -444,18 +481,23 @@ class LTX2Pipeline(Pipeline):
         gc.collect()
         torch.cuda.empty_cache()
 
-    def _move_transformer_scaffold_to_gpu(self):
-        """Move everything EXCEPT transformer_blocks to GPU.
+    _SCAFFOLD_EXCLUDE = {
+        "transformer_blocks",
+        "video_embeddings_connector", "audio_embeddings_connector",
+        "caption_projection", "audio_caption_projection",
+    }
 
-        This includes: patchify_proj, adaln_single, audio_adaln_single,
-        scale_shift_table, norm_out, proj_out, patchifier, etc.
+    def _move_transformer_scaffold_to_gpu(self):
+        """Move denoising-critical scaffold to GPU.
+
+        Excludes transformer_blocks (managed by block streaming) and
+        embedding connectors (only needed during text preprocessing,
+        managed separately by _move_connectors_to_gpu/cpu).
         """
         t = self._transformer
-        block_names = {"transformer_blocks"}
         for name, child in t.named_children():
-            if name not in block_names:
+            if name not in self._SCAFFOLD_EXCLUDE:
                 _move_module_to(child, self.device)
-        # Also move direct parameters/buffers on the model itself
         for name, param in t.named_parameters(recurse=False):
             param.data = param.data.to(device=self.device)
         for name, buf in t.named_buffers(recurse=False):
@@ -463,38 +505,13 @@ class LTX2Pipeline(Pipeline):
 
     def _move_transformer_scaffold_to_cpu(self):
         t = self._transformer
-        block_names = {"transformer_blocks"}
         for name, child in t.named_children():
-            if name not in block_names:
+            if name not in self._SCAFFOLD_EXCLUDE:
                 _move_module_to(child, "cpu")
         for name, param in t.named_parameters(recurse=False):
             param.data = param.data.to(device="cpu")
         for name, buf in t.named_buffers(recurse=False):
             buf.data = buf.data.to(device="cpu")
-
-    def _setup_block_streaming(self):
-        """Set up weight streaming using the dedicated weight_streaming module."""
-        from scope_ltx_2.weight_streaming import (
-            calculate_optimal_streaming_config,
-            setup_block_streaming,
-        )
-
-        blocks = self._transformer.transformer_blocks
-
-        free_mem, total_mem = torch.cuda.mem_get_info(self.device)
-        allocated = torch.cuda.memory_allocated(self.device)
-        available_gb = (total_mem - allocated) / 1024**3
-
-        config = calculate_optimal_streaming_config(
-            blocks,
-            available_vram_gb=available_gb,
-            safety_margin_gb=1.5,
-            min_resident_blocks=4,
-        )
-        config.compute_device = self.device
-
-        self._streaming_state = setup_block_streaming(blocks, config)
-        _log_gpu_memory("block streaming setup")
 
     def _cleanup_block_streaming(self):
         """Clean up block streaming and move all blocks back to CPU."""
@@ -504,7 +521,7 @@ class LTX2Pipeline(Pipeline):
         cleanup_block_streaming(
             self._transformer.transformer_blocks,
             self._streaming_state,
-            move_all_to_gpu=False,
+            move_to="cpu",
         )
         self._streaming_state = None
 
@@ -519,9 +536,6 @@ class LTX2Pipeline(Pipeline):
         """8-step Euler sampling with weight-streamed transformer blocks."""
         v_noisy = video_latents * sigmas[0]
         a_noisy = audio_latents * sigmas[0]
-
-        self._cleanup_block_streaming()
-        self._setup_block_streaming()
 
         for i in range(len(sigmas) - 1):
             sigma = sigmas[i]
@@ -557,8 +571,6 @@ class LTX2Pipeline(Pipeline):
                 f"v_pred: mean={v_pred.mean().item():.4f} std={v_pred.std().item():.4f} | "
                 f"v_noisy: mean={v_noisy.mean().item():.4f} std={v_noisy.std().item():.4f} range=[{v_noisy.min().item():.2f},{v_noisy.max().item():.2f}]"
             )
-
-        self._cleanup_block_streaming()
 
         return v_noisy, a_noisy
 

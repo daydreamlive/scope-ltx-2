@@ -171,13 +171,28 @@ def setup_block_streaming(
     blocks: nn.ModuleList,
     config: BlockStreamingConfig,
 ) -> BlockStreamingState:
-    if config.blocks_to_stream <= 0:
-        logger.info("Block streaming disabled")
-        return BlockStreamingState(blocks, config)
-
     num_blocks = len(blocks)
-    config.blocks_to_stream = min(config.blocks_to_stream, num_blocks - 1)
+    config.blocks_to_stream = max(0, min(config.blocks_to_stream, num_blocks - 1))
     state = BlockStreamingState(blocks, config)
+    device = config.compute_device
+
+    if config.blocks_to_stream <= 0:
+        logger.info(f"All {num_blocks} blocks fit on GPU — no streaming needed")
+        t0 = time.time()
+        for i in range(num_blocks):
+            block = blocks[i]
+            for param in block.parameters():
+                if param.device != device:
+                    param.data = param.data.to(device, non_blocking=True)
+            for buf in block.buffers():
+                if buf.device != device:
+                    buf.data = buf.data.to(device, non_blocking=True)
+            state.block_on_gpu[i] = True
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            logger.info(f"All blocks on GPU: {allocated:.2f} GB allocated ({time.time()-t0:.1f}s)")
+        return state
 
     logger.info(
         f"Setting up block streaming: {state.num_resident} resident, "
@@ -203,11 +218,11 @@ def setup_block_streaming(
     for i in range(state.streaming_start_idx):
         block = blocks[i]
         for param in block.parameters():
-            if param.device != config.compute_device:
-                param.data = param.data.to(config.compute_device, non_blocking=True)
+            if param.device != device:
+                param.data = param.data.to(device, non_blocking=True)
         for buf in block.buffers():
-            if buf.device != config.compute_device:
-                buf.data = buf.data.to(config.compute_device, non_blocking=True)
+            if buf.device != device:
+                buf.data = buf.data.to(device, non_blocking=True)
         state.block_on_gpu[i] = True
 
     if torch.cuda.is_available():
@@ -229,7 +244,7 @@ def setup_block_streaming(
 def cleanup_block_streaming(
     blocks: nn.ModuleList,
     state: BlockStreamingState | None = None,
-    move_all_to_gpu: bool = False,
+    move_to: str | torch.device | None = None,
 ) -> None:
     for block in blocks:
         block._forward_pre_hooks.clear()
@@ -238,9 +253,17 @@ def cleanup_block_streaming(
     if state is not None:
         state.cleanup()
 
-    if move_all_to_gpu and torch.cuda.is_available():
+    if move_to is not None:
+        target = torch.device(move_to)
         for block in blocks:
-            block.to(torch.device("cuda"))
+            for param in block.parameters():
+                if param.device != target:
+                    param.data = param.data.to(target, non_blocking=True)
+            for buf in block.buffers():
+                if buf.device != target:
+                    buf.data = buf.data.to(target, non_blocking=True)
+        if target.type == "cuda":
+            torch.cuda.synchronize(target)
 
     gc.collect()
     if torch.cuda.is_available():

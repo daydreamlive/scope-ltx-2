@@ -78,7 +78,7 @@ class LTX2Config(BasePipelineConfig):
     # Prompt support
     supports_prompts: ClassVar[bool] = True
 
-    produces_audio: ClassVar[bool] = False
+    produces_audio: ClassVar[bool] = True
 
     # Resolution settings (LTX2 works best at these resolutions)
     # CRITICAL: Set to minimal values to fit in 96GB VRAM

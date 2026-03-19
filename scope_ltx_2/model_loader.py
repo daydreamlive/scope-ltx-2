@@ -35,7 +35,7 @@ def _fp8_scaled_forward(
     weight_scale. We quantize the input to FP8 using the stored input_scale,
     then use _scaled_mm for the matmul, and add bias in the output dtype.
     """
-    weight_t = self.weight.data.t().contiguous()
+    weight_t = self.weight.data.t()
     input_scale: torch.Tensor = self._fp8_input_scale
     weight_scale: torch.Tensor = self._fp8_weight_scale
 

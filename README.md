@@ -2,9 +2,9 @@
 
 [![Discord](https://img.shields.io/badge/Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/mnfGR4Fjhp)
 
-[Scope](https://github.com/daydreamlive/scope) plugin providing the LTX-2 text-to-video generation pipeline from [Lightricks](https://github.com/Lightricks/LTX-2).
+[Scope](https://github.com/daydreamlive/scope) plugin providing the LTX 2.3 audio-video generation pipeline from [Lightricks](https://github.com/Lightricks/LTX-2).
 
-LTX-2 is a DiT-based foundation model for high-quality video generation. Unlike autoregressive models, LTX-2 generates complete video clips in a single forward pass.
+LTX 2.3 is a 22B-parameter DiT (Diffusion Transformer) that generates synchronized video and audio from text prompts. This plugin uses ComfyUI-derived model loading and inference code with [Kijai's separated FP8 checkpoints](https://huggingface.co/Kijai/LTX2.3_comfy), enabling it to run on a single **24GB GPU**.
 
 > [!IMPORTANT]
 > Plugin support is a preview feature in Scope right now and the APIs are subject to breaking change prior to official release.
@@ -12,30 +12,30 @@ LTX-2 is a DiT-based foundation model for high-quality video generation. Unlike 
 
 ## Features
 
-- **High-quality video generation** from text prompts
+- **Audio-video generation** from text prompts (synchronized audio + video)
 - **Non-autoregressive** - generates complete clips (33+ frames) at once
-- **FP8 quantization** support for reduced VRAM usage
+- **Runs on 24GB GPUs** - FP8 quantization baked into checkpoints, CPU-resident transformer with double-buffered weight streaming
+- **8-step distilled inference** - fast generation with predefined sigma schedule
 - **Configurable output** - resolution, frame count, frame rate, seed
-
-### Audio Support (Stubbed)
-
-LTX-2 natively supports synchronized audio-video generation. However, **audio output is currently disabled** because Scope's main branch doesn't support audio channels via WebRTC yet.
-
-Audio latents are generated during inference but not decoded. When Scope adds audio channel support, this plugin can be updated to enable full audio output. See [PLUGIN.md](PLUGIN.md) for technical details.
 
 ## Requirements
 
-- **VRAM**: ~96GB minimum (H100 recommended)
-  - Text encoder (Gemma 3 12B): ~20GB
-  - Transformer (FP8): ~25GB
-  - Video decoder: ~3GB
-  - Activations: ~50GB at 512×768×33 frames
+- **VRAM**: ~22GB (24GB GPU recommended, e.g. RTX 4090 / A5000)
+  - Gemma 3 12B FP8 text encoder: ~13GB (offloaded after encoding)
+  - Transformer 22B FP8: ~23GB total, CPU-resident with block streaming
+  - Video VAE + Audio VAE + Vocoder: ~1GB (GPU-resident)
 - **Python**: 3.12+
 - **CUDA**: 12.8+
 
 ## Supported Models
 
-- [LTX-2 19B Distilled](https://huggingface.co/Lightricks/LTX-2) (via the `ltx2` pipeline)
+This plugin downloads weights from three HuggingFace repositories:
+
+| Repository | Contents |
+|------------|----------|
+| [Kijai/LTX2.3_comfy](https://huggingface.co/Kijai/LTX2.3_comfy) | Transformer (22B distilled v3 FP8), text projection, video VAE, audio VAE |
+| [Comfy-Org/ltx-2](https://huggingface.co/Comfy-Org/ltx-2) | Gemma 3 12B FP8 text encoder |
+| [google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it) | Gemma tokenizer and config files |
 
 ## Install
 
@@ -69,22 +69,14 @@ DAYDREAM_SCOPE_PREVIEW=1 uv run daydream-scope install --upgrade git+https://git
 
 ## Usage
 
-### Step 1: Accept Model Licenses on HuggingFace
+### Step 1: Accept Gemma License on HuggingFace
 
-Both models used by this plugin are **gated** on HuggingFace, meaning you must accept their license agreements before downloading.
+The Gemma tokenizer files are hosted in a **gated** repository. You must accept the license to download them.
 
 > [!IMPORTANT]
 > You must complete these steps while **logged in** to HuggingFace, or downloads will fail with "403 Forbidden" errors.
 
-#### Lightricks/LTX-2
-
-1. Go to [huggingface.co/Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2)
-2. Click **"Agree and access repository"** to accept the license
-3. You should see "You have been granted access" confirmation
-
-#### Google Gemma 3 12B (Required for Text Encoder)
-
-The Gemma model requires additional steps:
+#### Google Gemma 3 12B
 
 1. Go to [huggingface.co/google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it)
 2. Click **"Agree and access repository"** to accept Google's Gemma Terms of Use
@@ -93,6 +85,9 @@ The Gemma model requires additional steps:
    - Provide your name and affiliation
    - Acknowledge the usage restrictions
 4. Wait for access approval (usually instant, but can take a few minutes)
+
+> [!NOTE]
+> The other two repositories ([Kijai/LTX2.3_comfy](https://huggingface.co/Kijai/LTX2.3_comfy) and [Comfy-Org/ltx-2](https://huggingface.co/Comfy-Org/ltx-2)) are not gated and do not require license acceptance.
 
 > [!NOTE]
 > Gemma models are subject to Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms). Make sure you comply with the terms for your use case.
@@ -157,19 +152,18 @@ uv run download_models --pipeline ltx2
 | `height` | 512 | ✅ Yes | Output video height in pixels |
 | `width` | 768 | ✅ Yes | Output video width in pixels |
 | `base_seed` | 42 | ✅ Yes | Random seed for reproducible generation |
-| `use_fp8` | true | ❌ Config only | Enable FP8 quantization for transformer |
 | `num_frames` | 33 | ⚠️ API only | Number of frames to generate (~1.3 seconds at 24fps) |
 | `frame_rate` | 24.0 | ⚠️ API only | Output frame rate |
 | `randomize_seed` | false | ⚠️ API only | Generate new random seed each chunk |
+| `ffn_chunk_size` | 4096 | ⚠️ API only | Chunk size for FFN processing (lower = less memory, more overhead; `null` to disable) |
 
 > [!NOTE]
 > Parameters marked "API only" work but don't have UI controls in Scope's main branch.
-> Use the `/load` API endpoint to set these parameters. See [PLUGIN.md](PLUGIN.md) for details.
+> Use the `/load` API endpoint to set these parameters.
 
 #### Using API-Only Parameters
 
 ```bash
-# Set num_frames and randomize_seed via API
 curl -X POST http://localhost:8000/load \
   -H "Content-Type: application/json" \
   -d '{
@@ -183,27 +177,25 @@ curl -X POST http://localhost:8000/load \
   }'
 ```
 
-#### LTX-2 Frame Count Formula
+#### Frame Count Formula
 
-LTX-2 works best with frame counts following the formula `8×K+1`:
-- 1, 9, 17, 25, **33**, 41, 49, 57, 65, ...
+LTX 2.3 works best with frame counts following the formula `8×K+1`:
+- 9, 17, 25, **33**, 41, 49, 57, 65, ...
 
-Other values work but may be less optimal.
+Other values are automatically snapped to the nearest valid count.
 
 ### Memory Optimization Tips
 
-1. **Use FP8 quantization** (enabled by default) - reduces transformer from ~45GB to ~25GB
-2. **Lower resolution** - activations scale with resolution × frames
-3. **Fewer frames** - each frame at 512×768 uses ~1.5GB for activations
+1. **Lower resolution** - activations scale with resolution × frames
+2. **Fewer frames** - reduces both latent size and activation memory
+3. **Reduce `ffn_chunk_size`** - smaller chunks use less peak activation memory at the cost of more kernel launches
 4. **Set PYTORCH_CUDA_ALLOC_CONF** - `expandable_segments:True` prevents fragmentation
 
 ## Limitations
 
 ### Current Limitations
 
-- **No real-time streaming** - LTX-2 generates complete clips, not frame-by-frame
-- **High VRAM requirement** - 96GB+ recommended
-- **Audio disabled** - waiting for Scope audio channel support
+- **No real-time streaming** - LTX 2.3 generates complete clips, not frame-by-frame
 - **No image conditioning** - text-to-video only (image conditioning planned)
 - **No LoRA support** - planned for future release
 
@@ -215,17 +207,19 @@ These features work in the plugin but lack UI controls in Scope's main branch:
 |---------|--------|------------|
 | `num_frames` slider | No UI | Use API to set value |
 | `randomize_seed` toggle | No UI | Use API to set value |
+| `ffn_chunk_size` control | No UI | Use API to set value |
 | Fixed FPS playback | Partial | Video generated correctly, playback may vary |
-
-See [PLUGIN.md](PLUGIN.md) for the full compatibility matrix and what changes are needed in Scope main to enable these features.
 
 ## Architecture
 
-LTX-2 uses a DiT (Diffusion Transformer) architecture with:
-- **Gemma 3 12B** text encoder for prompt understanding
-- **19B parameter** transformer for video denoising
-- **Video VAE** for latent space encoding/decoding
-- **Distilled inference** with 8 predefined sigma values
+LTX 2.3 uses a DiT (Diffusion Transformer) architecture with standalone ComfyUI-adapted inference code:
+
+- **Gemma 3 12B FP8** text encoder for prompt understanding, with per-token RMS normalization across all 49 layers and aggregate embedding projection
+- **22B parameter** transformer for joint audio-video denoising, loaded with FP8 scaled matmul (`torch._scaled_mm`) for quantized layers
+- **Video VAE** for latent space decoding (32x spatial, 8x temporal downsampling)
+- **Audio VAE + Vocoder** for synchronized audio generation (mel spectrogram decoding with bandwidth extension)
+- **8-step distilled Euler sampling** with predefined sigma schedule
+- **CPU-to-GPU weight streaming** - transformer blocks are CPU-resident in pinned memory and double-buffered onto GPU via async CUDA streams during inference, allowing the full 22B model to run within 24GB VRAM
 
 For more details, see the [official LTX-2 documentation](https://github.com/Lightricks/LTX-2).
 
@@ -236,16 +230,14 @@ For more details, see the [official LTX-2 documentation](https://github.com/Ligh
 If you encounter OOM errors:
 1. Reduce `num_frames` (try 17 instead of 33)
 2. Reduce resolution (try 384×512)
-3. Ensure no other GPU processes are running
-4. Check that FP8 is enabled (`use_fp8: true`)
+3. Reduce `ffn_chunk_size` (try 2048 or 1024)
+4. Ensure no other GPU processes are running
 
 ### Model Download Fails
 
 **"403 Forbidden" or "Access to model is restricted":**
-- You haven't accepted the license agreement on HuggingFace
-- Go to the model page while logged in and click "Agree and access repository":
-  - [Lightricks/LTX-2](https://huggingface.co/Lightricks/LTX-2)
-  - [google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it)
+- You haven't accepted the Gemma license agreement on HuggingFace
+- Go to [google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it) while logged in and click "Agree and access repository"
 
 **"Invalid token" or "Token not found":**
 - Verify `HF_TOKEN` environment variable is set correctly
@@ -264,16 +256,10 @@ If you encounter OOM errors:
 
 ### Slow Generation
 
-LTX-2 generates complete clips rather than streaming frames. Generation time depends on:
+LTX 2.3 generates complete clips rather than streaming frames. Generation time depends on:
 - Number of frames
 - Resolution
-- GPU performance
-
-Typical times on H100: ~10-20 seconds for 33 frames at 512×768.
-
-## Development
-
-See [PLUGIN.md](PLUGIN.md) for detailed integration notes and the roadmap for audio support.
+- GPU performance and CPU-to-GPU transfer bandwidth (weight streaming)
 
 ## License
 
@@ -282,4 +268,6 @@ This plugin is licensed under the same terms as the [LTX-2 model](https://github
 ## Acknowledgments
 
 - [Lightricks](https://www.lightricks.com/) for the LTX-2 model
+- [Kijai](https://huggingface.co/Kijai) for the separated ComfyUI-format FP8 checkpoints
+- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) for the model loading and VAE implementations this plugin adapts
 - [Daydream](https://daydreamlive.ai/) for the Scope platform

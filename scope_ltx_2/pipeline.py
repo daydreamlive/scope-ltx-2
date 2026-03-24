@@ -69,8 +69,6 @@ def _load_sd_with_prefix_replace(
                     break
     return sd
 
-DISTILLED_SIGMA_VALUES = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
-
 
 def _log_gpu_memory(stage: str) -> None:
     if torch.cuda.is_available():
@@ -102,6 +100,9 @@ class LTX2Pipeline(Pipeline):
         num_frames: int = 33,
         frame_rate: float = 24.0,
         randomize_seed: bool = False,
+        num_steps: int = 8,
+        schedule: str = "distilled",
+        sigmas: list[float] | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
         transformer_path: str | None = None,
@@ -114,6 +115,7 @@ class LTX2Pipeline(Pipeline):
         **kwargs,
     ):
         from .model_loader import load_transformer
+        from .schema import make_sigma_schedule
         from .text_encoder import TextEmbeddingProjection, load_gemma_text_encoder
 
         if device is None:
@@ -126,6 +128,9 @@ class LTX2Pipeline(Pipeline):
         self.num_frames = num_frames
         self.frame_rate = frame_rate
         self.randomize_seed = randomize_seed
+        self.num_steps = num_steps
+        self.schedule = schedule
+        self.sigmas = sigmas if sigmas is not None else make_sigma_schedule(num_steps, schedule)
         self.ffn_chunk_size = ffn_chunk_size
 
         if kwargs:
@@ -375,7 +380,7 @@ class LTX2Pipeline(Pipeline):
     def _generate(self, **kwargs) -> dict:
         from .text_encoder import encode_prompt
 
-        from .schema import VAE_SPATIAL_FACTOR, snap_frame_count, snap_to_multiple
+        from .schema import VAE_SPATIAL_FACTOR, make_sigma_schedule, snap_frame_count, snap_to_multiple
 
         prompts = kwargs.get("prompts", [{"text": "a beautiful sunset", "weight": 1.0}])
         seed = kwargs.get("seed", kwargs.get("base_seed", 42))
@@ -476,9 +481,16 @@ class LTX2Pipeline(Pipeline):
         )
 
         # =================================================================
-        # 8-step Euler denoising
+        # Euler denoising
         # =================================================================
-        sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=self.device, dtype=self.dtype)
+        custom_sigmas = kwargs.get("sigmas")
+        if custom_sigmas is not None:
+            sigma_values = custom_sigmas
+        else:
+            num_steps = kwargs.get("num_steps", self.num_steps)
+            schedule = kwargs.get("schedule", self.schedule)
+            sigma_values = make_sigma_schedule(num_steps, schedule)
+        sigmas = torch.tensor(sigma_values, device=self.device, dtype=self.dtype)
         logger.info(f"Denoising {num_frames} frames at {height}x{width} ({len(sigmas)-1} steps)")
 
         self._ensure_denoising_ready()

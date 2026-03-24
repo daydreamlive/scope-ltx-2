@@ -186,7 +186,7 @@ class LTX2Config(BasePipelineConfig):
     ]
 
     produces_audio: ClassVar[bool] = True
-    supports_lora: ClassVar[bool] = False
+    supports_lora: ClassVar[bool] = True
     supports_vace: ClassVar[bool] = False
     supports_cache_management: ClassVar[bool] = False
     supports_kv_cache_bias: ClassVar[bool] = False
@@ -196,6 +196,14 @@ class LTX2Config(BasePipelineConfig):
 
     modes: ClassVar[dict[str, ModeDefaults]] = {"text": ModeDefaults(default=True)}
     supports_prompts: ClassVar[bool] = True
+
+    lora_merge_strategy: str = Field(
+        default="permanent_merge",
+        description="LoRA merge strategy (only permanent_merge is supported for FP8 models)",
+        json_schema_extra=ui_field_config(
+            order=3, component="lora", is_load_param=True
+        ),
+    )
 
     height: int = Field(
         default=512,

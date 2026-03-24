@@ -112,6 +112,7 @@ class LTX2Pipeline(Pipeline):
         gemma_model_path: str | None = None,
         gemma_tokenizer_path: str | None = None,
         ffn_chunk_size: int | None = 4096,
+        loras: list[dict] | None = None,
         **kwargs,
     ):
         from .model_loader import load_transformer
@@ -183,6 +184,13 @@ class LTX2Pipeline(Pipeline):
         # Step 3: Load transformer to CPU
         logger.info("Loading transformer (FP8, CPU-resident)...")
         self._transformer = load_transformer(transformer_path, device=torch.device("cpu"), dtype=dtype)
+
+        # Step 3b: Merge LoRA weights (before FFN chunking / streaming setup)
+        if loras:
+            from .lora import load_and_merge_loras
+            self.loaded_lora_adapters = load_and_merge_loras(self._transformer, loras)
+        else:
+            self.loaded_lora_adapters = []
 
         if ffn_chunk_size is not None:
             self._apply_ffn_chunking(ffn_chunk_size)

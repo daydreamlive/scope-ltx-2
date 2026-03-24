@@ -375,16 +375,28 @@ class LTX2Pipeline(Pipeline):
     def _generate(self, **kwargs) -> dict:
         from .text_encoder import encode_prompt
 
+        from .schema import VAE_SPATIAL_FACTOR, snap_frame_count, snap_to_multiple
+
         prompts = kwargs.get("prompts", [{"text": "a beautiful sunset", "weight": 1.0}])
         seed = kwargs.get("seed", kwargs.get("base_seed", 42))
+
         num_frames_raw = kwargs.get("num_frames", self.num_frames)
-        num_frames = round((num_frames_raw - 1) / 8) * 8 + 1
-        num_frames = max(num_frames, 9)
+        num_frames = snap_frame_count(num_frames_raw)
         if num_frames != num_frames_raw:
-            logger.info(f"Snapped num_frames {num_frames_raw} -> {num_frames} (must be 8K+1)")
+            logger.info(f"Snapped num_frames {num_frames_raw} -> {num_frames} (must be N*8+1)")
+
         frame_rate = kwargs.get("frame_rate", self.frame_rate)
-        height = kwargs.get("height", self.height)
-        width = kwargs.get("width", self.width)
+
+        height_raw = kwargs.get("height", self.height)
+        height = snap_to_multiple(height_raw, VAE_SPATIAL_FACTOR)
+        if height != height_raw:
+            logger.info(f"Snapped height {height_raw} -> {height} (must be multiple of {VAE_SPATIAL_FACTOR})")
+
+        width_raw = kwargs.get("width", self.width)
+        width = snap_to_multiple(width_raw, VAE_SPATIAL_FACTOR)
+        if width != width_raw:
+            logger.info(f"Snapped width {width_raw} -> {width} (must be multiple of {VAE_SPATIAL_FACTOR})")
+
         randomize_seed = kwargs.get("randomize_seed", self.randomize_seed)
 
         if randomize_seed:
@@ -445,12 +457,11 @@ class LTX2Pipeline(Pipeline):
         # =================================================================
         # Prepare latent noise
         # =================================================================
-        vae_temporal_factor = 8
-        vae_spatial_factor = 32
+        from .schema import VAE_TEMPORAL_FACTOR
 
-        latent_frames = (num_frames - 1) // vae_temporal_factor + 1
-        latent_height = height // vae_spatial_factor
-        latent_width = width // vae_spatial_factor
+        latent_frames = (num_frames - 1) // VAE_TEMPORAL_FACTOR + 1
+        latent_height = height // VAE_SPATIAL_FACTOR
+        latent_width = width // VAE_SPATIAL_FACTOR
 
         video_latents = torch.randn(
             (1, 128, latent_frames, latent_height, latent_width),

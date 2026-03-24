@@ -2,7 +2,7 @@
 
 from typing import ClassVar
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from scope.core.pipelines.artifacts import HuggingfaceRepoArtifact
 from scope.core.pipelines.base_schema import (
@@ -10,6 +10,20 @@ from scope.core.pipelines.base_schema import (
     ModeDefaults,
     ui_field_config,
 )
+
+VAE_SPATIAL_FACTOR = 32
+VAE_TEMPORAL_FACTOR = 8
+
+
+def snap_to_multiple(value: int, factor: int) -> int:
+    """Round to the nearest multiple of *factor* (minimum one unit)."""
+    return max(factor, round(value / factor) * factor)
+
+
+def snap_frame_count(value: int) -> int:
+    """Snap to the nearest valid LTX-2.3 frame count (N*8+1, minimum 9)."""
+    n = max(round((value - 1) / VAE_TEMPORAL_FACTOR), 1)
+    return n * VAE_TEMPORAL_FACTOR + 1
 
 
 class LTX2Config(BasePipelineConfig):
@@ -72,38 +86,52 @@ class LTX2Config(BasePipelineConfig):
     modes: ClassVar[dict[str, ModeDefaults]] = {"text": ModeDefaults(default=True)}
     supports_prompts: ClassVar[bool] = True
 
-    # Resolution
     height: int = Field(
         default=512,
-        ge=1,
-        description="Output height in pixels",
+        ge=VAE_SPATIAL_FACTOR,
+        description=(
+            "Output height in pixels. "
+            f"Must be a multiple of {VAE_SPATIAL_FACTOR}; other values are snapped."
+        ),
         json_schema_extra=ui_field_config(
             order=4, component="resolution", is_load_param=True
         ),
     )
     width: int = Field(
         default=768,
-        ge=1,
-        description="Output width in pixels",
+        ge=VAE_SPATIAL_FACTOR,
+        description=(
+            "Output width in pixels. "
+            f"Must be a multiple of {VAE_SPATIAL_FACTOR}; other values are snapped."
+        ),
         json_schema_extra=ui_field_config(
             order=4, component="resolution", is_load_param=True
         ),
     )
 
-    # LTX-2 VAE requires frame counts following 8K+1 (1, 9, 17, 25, 33, 41, ...)
     num_frames: int = Field(
         default=33,
         ge=9,
         le=257,
         description=(
             "Number of frames to generate per inference call. "
-            "LTX-2 works best with 8K+1 values (9, 17, 25, 33, 41, 49, ...). "
+            "Must follow N*8+1 (9, 17, 25, 33, 41, 49, ...). "
             "Other values are snapped to the nearest valid count."
         ),
         json_schema_extra=ui_field_config(
             order=5, label="Frame Count", is_load_param=False
         ),
     )
+
+    @field_validator("height", "width", mode="before")
+    @classmethod
+    def _snap_resolution(cls, v: int) -> int:
+        return snap_to_multiple(int(v), VAE_SPATIAL_FACTOR)
+
+    @field_validator("num_frames", mode="before")
+    @classmethod
+    def _snap_num_frames(cls, v: int) -> int:
+        return snap_frame_count(int(v))
 
     frame_rate: float = 24.0
 

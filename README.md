@@ -149,12 +149,12 @@ uv run download_models --pipeline ltx2
 
 | Parameter | Default | UI Available | Description |
 |-----------|---------|--------------|-------------|
-| `height` | 512 | ✅ Yes | Output video height in pixels |
-| `width` | 768 | ✅ Yes | Output video width in pixels |
+| `height` | 384 | ✅ Yes | Output video height in pixels |
+| `width` | 320 | ✅ Yes | Output video width in pixels |
 | `base_seed` | 42 | ✅ Yes | Random seed for reproducible generation |
-| `num_frames` | 33 | ⚠️ API only | Number of frames to generate (~1.3 seconds at 24fps) |
-| `frame_rate` | 24.0 | ⚠️ API only | Output frame rate |
-| `randomize_seed` | false | ⚠️ API only | Generate new random seed each chunk |
+| `num_frames` | 129 | ✅ Yes | Number of frames to generate (~1.3 seconds at 24fps) |
+| `randomize_seed` | true | ✅ Yes | Generate new random seed each chunk |
+| `frame_rate` | 25.0 | ⚠️ API only | Output frame rate |
 | `ffn_chunk_size` | 4096 | ⚠️ API only | Chunk size for FFN processing (lower = less memory, more overhead; `null` to disable) |
 
 > [!NOTE]
@@ -169,9 +169,9 @@ curl -X POST http://localhost:8000/load \
   -d '{
     "pipeline_id": "ltx2",
     "params": {
-      "height": 512,
-      "width": 768,
-      "num_frames": 49,
+      "height": 384,
+      "width": 320,
+      "num_frames": 129,
       "randomize_seed": true
     }
   }'
@@ -180,7 +180,7 @@ curl -X POST http://localhost:8000/load \
 #### Frame Count Formula
 
 LTX 2.3 works best with frame counts following the formula `8×K+1`:
-- 9, 17, 25, **33**, 41, 49, 57, 65, ...
+- 9, 17, 25, 33, 41, 49, 57, 65, ...
 
 Other values are automatically snapped to the nearest valid count.
 
@@ -228,8 +228,8 @@ For more details, see the [official LTX-2 documentation](https://github.com/Ligh
 ### Out of Memory (OOM)
 
 If you encounter OOM errors:
-1. Reduce `num_frames` (try 17 instead of 33)
-2. Reduce resolution (try 384×512)
+1. Reduce `num_frames` (try 33 instead of 129)
+2. Reduce resolution (try 320x320)
 3. Reduce `ffn_chunk_size` (try 2048 or 1024)
 4. Ensure no other GPU processes are running
 

@@ -89,17 +89,19 @@ def _move_module_to(module: torch.nn.Module, device, non_blocking=False):
 class LTX2Pipeline(Pipeline):
     """LTX 2.3 audio-video generation pipeline."""
 
+    _current_instance: "LTX2Pipeline | None" = None
+
     @classmethod
     def get_config_class(cls) -> type["BasePipelineConfig"]:
         return LTX2Config
 
     def __init__(
         self,
-        height: int = 512,
-        width: int = 768,
-        num_frames: int = 33,
+        height: int = 384,
+        width: int = 320,
+        num_frames: int = 129,
         frame_rate: float = 24.0,
-        randomize_seed: bool = False,
+        randomize_seed: bool = True,
         num_steps: int = 8,
         schedule: str = "distilled",
         sigmas: list[float] | None = None,
@@ -118,6 +120,14 @@ class LTX2Pipeline(Pipeline):
         from .model_loader import load_transformer
         from .schema import make_sigma_schedule
         from .text_encoder import TextEmbeddingProjection, load_gemma_text_encoder
+
+        prev = LTX2Pipeline._current_instance
+        if prev is not None:
+            logger.info("Cleaning up previous LTX2Pipeline instance before loading new one...")
+            prev.unload()
+            LTX2Pipeline._current_instance = None
+
+        self._cancelled = False
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -212,6 +222,85 @@ class LTX2Pipeline(Pipeline):
 
         logger.info(f"LTX 2.3 pipeline loaded in {time.time() - start:.1f}s")
         _log_gpu_memory("all loaded")
+
+        LTX2Pipeline._current_instance = self
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def unload(self):
+        """Release all GPU resources for a clean pipeline restart.
+
+        Called automatically when a new LTX2Pipeline is created, and as a
+        safety net from __del__. Sets the cancellation flag so any in-flight
+        generation aborts at the next denoising step.
+        """
+        self._cancelled = True
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
+        try:
+            self._cleanup_block_streaming()
+        except Exception as e:
+            logger.warning(f"Block streaming cleanup error during unload: {e}")
+
+        try:
+            self._move_transformer_scaffold_to_cpu()
+        except Exception as e:
+            logger.warning(f"Scaffold offload error during unload: {e}")
+
+        try:
+            self._move_connectors_to_cpu()
+        except Exception as e:
+            logger.warning(f"Connector offload error during unload: {e}")
+
+        try:
+            if getattr(self, '_text_encoder_on_gpu', False):
+                _move_module_to(self._text_encoder, "cpu")
+                self._text_encoder_on_gpu = False
+        except Exception as e:
+            logger.warning(f"Text encoder offload error during unload: {e}")
+
+        try:
+            if getattr(self, '_vaes_on_gpu', False):
+                for attr in ('_video_vae', '_audio_vae', '_vocoder'):
+                    mod = getattr(self, attr, None)
+                    if mod is not None:
+                        _move_module_to(mod, "cpu")
+                self._vaes_on_gpu = False
+        except Exception as e:
+            logger.warning(f"VAE offload error during unload: {e}")
+
+        for attr in ('_text_encoder', '_tokenizer', '_text_projection',
+                      '_transformer', '_video_vae', '_audio_vae', '_vocoder'):
+            try:
+                delattr(self, attr)
+            except AttributeError:
+                pass
+
+        self._cached_context = None
+        self._cached_prompt_text = None
+        self._streaming_state = None
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        _log_gpu_memory("pipeline unloaded")
+
+        if LTX2Pipeline._current_instance is self:
+            LTX2Pipeline._current_instance = None
+
+    def __del__(self):
+        try:
+            self.unload()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Model management helpers
@@ -508,6 +597,15 @@ class LTX2Pipeline(Pipeline):
             video_latents, audio_latents, context, sigmas, frame_rate,
         )
 
+        if self._cancelled:
+            logger.info("Generation cancelled, skipping VAE decode")
+            return {
+                "video": torch.zeros(1, height, width, 3),
+                "audio": torch.zeros(2, 1),
+                "audio_sample_rate": 48000,
+                "frame_rate": frame_rate,
+            }
+
         # Offload resident blocks to free VRAM for VAE decode.
         # Streaming state (hooks, pinned memory, scaffold) persists — resident
         # blocks will be reloaded by pre-forward hooks on the next denoising pass.
@@ -675,6 +773,10 @@ class LTX2Pipeline(Pipeline):
         a_noisy = audio_latents * sigmas[0]
 
         for i in range(len(sigmas) - 1):
+            if self._cancelled:
+                logger.info("Denoising cancelled, aborting")
+                break
+
             sigma = sigmas[i]
             sigma_next = sigmas[i + 1]
             t0 = time.time()

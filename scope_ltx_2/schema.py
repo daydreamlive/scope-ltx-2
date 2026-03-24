@@ -206,7 +206,7 @@ class LTX2Config(BasePipelineConfig):
     )
 
     height: int = Field(
-        default=512,
+        default=384,
         ge=VAE_SPATIAL_FACTOR,
         description=(
             "Output height in pixels. "
@@ -217,7 +217,7 @@ class LTX2Config(BasePipelineConfig):
         ),
     )
     width: int = Field(
-        default=768,
+        default=320,
         ge=VAE_SPATIAL_FACTOR,
         description=(
             "Output width in pixels. "
@@ -229,7 +229,7 @@ class LTX2Config(BasePipelineConfig):
     )
 
     num_frames: int = Field(
-        default=33,
+        default=129,
         ge=9,
         le=257,
         description=(
@@ -305,7 +305,7 @@ class LTX2Config(BasePipelineConfig):
 
     # Seed randomization
     randomize_seed: bool = Field(
-        default=False,
+        default=True,
         description="Randomize seed on every inference call for varied outputs between chunks",
         json_schema_extra=ui_field_config(
             order=9, label="Randomize Seed", is_load_param=False

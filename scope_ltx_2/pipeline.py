@@ -86,6 +86,32 @@ def _move_module_to(module: torch.nn.Module, device, non_blocking=False):
         buf.data = buf.data.to(device=device, non_blocking=non_blocking)
 
 
+def _load_image_tensor(source, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Load an image from a file path or pass through an existing tensor.
+
+    Args:
+        source: File path (str/Path) or tensor in ``(H, W, C)``/``(F, H, W, C)`` [0, 1].
+        device: Target device.
+        dtype: Target dtype.
+
+    Returns:
+        Tensor of shape ``(F, H, W, C)`` in ``[0, 1]`` float range on *device*.
+    """
+    if isinstance(source, (str, Path)):
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+
+        img = Image.open(str(source)).convert("RGB")
+        # to_tensor returns (C, H, W) in [0, 1]
+        tensor = TF.to_tensor(img).permute(1, 2, 0)  # -> (H, W, C)
+        return tensor.unsqueeze(0).to(device=device, dtype=dtype)  # -> (1, H, W, C)
+
+    t = source.to(device=device, dtype=dtype)
+    if t.ndim == 3:
+        t = t.unsqueeze(0)
+    return t
+
+
 class LTX2Pipeline(Pipeline):
     """LTX 2.3 audio-video generation pipeline."""
 
@@ -557,7 +583,19 @@ class LTX2Pipeline(Pipeline):
         self._move_vaes_to_gpu()
 
         # =================================================================
-        # Prepare latent noise
+        # Prepare sigma schedule (needed before latent init for i2v)
+        # =================================================================
+        custom_sigmas = kwargs.get("sigmas")
+        if custom_sigmas is not None:
+            sigma_values = custom_sigmas
+        else:
+            num_steps = kwargs.get("num_steps", self.num_steps)
+            schedule = kwargs.get("schedule", self.schedule)
+            sigma_values = make_sigma_schedule(num_steps, schedule)
+        sigmas = torch.tensor(sigma_values, device=self.device, dtype=self.dtype)
+
+        # =================================================================
+        # Prepare latent noise + optional i2v conditioning
         # =================================================================
         from .schema import VAE_TEMPORAL_FACTOR
 
@@ -565,10 +603,41 @@ class LTX2Pipeline(Pipeline):
         latent_height = height // VAE_SPATIAL_FACTOR
         latent_width = width // VAE_SPATIAL_FACTOR
 
-        video_latents = torch.randn(
+        video_noise = torch.randn(
             (1, 128, latent_frames, latent_height, latent_width),
             generator=generator, device=self.device, dtype=self.dtype,
         )
+
+        # Check for i2v image input (file path or tensor)
+        i2v_source = kwargs.get("i2v_image") or kwargs.get("first_frame_image")
+        i2v_strength = float(kwargs.get("i2v_strength", 1.0))
+        denoise_mask = None
+        clean_latent = None
+
+        if i2v_source is not None:
+            logger.info(f"Image-to-video conditioning (strength={i2v_strength})")
+            i2v_image = _load_image_tensor(i2v_source, self.device, self.dtype)
+            image_latent = self._encode_image(i2v_image, height, width)
+            cond_frames = image_latent.shape[2]
+            logger.info(
+                f"Encoded i2v image: {i2v_image.shape} -> latent {image_latent.shape} "
+                f"({cond_frames} conditioned frame(s))"
+            )
+
+            clean_latent = torch.zeros_like(video_noise)
+            clean_latent[:, :, :cond_frames] = image_latent
+
+            # denoise_mask: 0 = fully conditioned, 1 = fully noisy
+            denoise_mask = torch.ones(
+                (1, 1, latent_frames, 1, 1),
+                device=self.device, dtype=self.dtype,
+            )
+            denoise_mask[:, :, :cond_frames] = 1.0 - i2v_strength
+
+        # CONST noise_scaling at sigma_0: sigma*noise + (1-sigma)*latent_image.
+        # At sigma=1 this is pure noise regardless of i2v — the conditioning
+        # is injected via per-step masking inside _euler_denoise, not here.
+        video_latents = video_noise
 
         video_duration_sec = num_frames / frame_rate
         audio_latent_time = round(video_duration_sec * 25)
@@ -580,14 +649,6 @@ class LTX2Pipeline(Pipeline):
         # =================================================================
         # Euler denoising
         # =================================================================
-        custom_sigmas = kwargs.get("sigmas")
-        if custom_sigmas is not None:
-            sigma_values = custom_sigmas
-        else:
-            num_steps = kwargs.get("num_steps", self.num_steps)
-            schedule = kwargs.get("schedule", self.schedule)
-            sigma_values = make_sigma_schedule(num_steps, schedule)
-        sigmas = torch.tensor(sigma_values, device=self.device, dtype=self.dtype)
         logger.info(f"Denoising {num_frames} frames at {height}x{width} ({len(sigmas)-1} steps)")
 
         self._ensure_denoising_ready()
@@ -595,6 +656,8 @@ class LTX2Pipeline(Pipeline):
 
         video_latents, audio_latents = self._euler_denoise(
             video_latents, audio_latents, context, sigmas, frame_rate,
+            denoise_mask=denoise_mask,
+            clean_latent=clean_latent,
         )
 
         if self._cancelled:
@@ -767,8 +830,25 @@ class LTX2Pipeline(Pipeline):
         context: torch.Tensor,
         sigmas: torch.Tensor,
         frame_rate: float,
+        denoise_mask: torch.Tensor | None = None,
+        clean_latent: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """8-step Euler sampling with weight-streamed transformer blocks."""
+        """Euler sampling with weight-streamed transformer blocks.
+
+        For i2v conditioning this replicates ComfyUI's
+        ``KSamplerX0Inpaint`` + ``LTXAV.process_timestep`` behaviour:
+
+        1. **Pre-model masking** — conditioned frames are replaced with the
+           clean ``clean_latent`` (LTXAV ``scale_latent_inpaint`` returns
+           ``latent_image`` directly, no noise).
+        2. **Per-patch timestep** — ``denoise_mask * sigma`` is patchified so
+           conditioned patches receive ``timestep=0`` (model AdaLN treats
+           them as clean) while unconditioned patches receive the current
+           ``sigma``.
+        3. **Post-step masking** — after the Euler update, conditioned frames
+           are anchored back to ``clean_latent`` (equivalent to ComfyUI's
+           post-model output masking which forces ``d=0`` for those frames).
+        """
         v_noisy = video_latents * sigmas[0]
         a_noisy = audio_latents * sigmas[0]
 
@@ -781,16 +861,30 @@ class LTX2Pipeline(Pipeline):
             sigma_next = sigmas[i + 1]
             t0 = time.time()
 
-            timestep = sigma.expand(v_noisy.shape[0])
+            # -- i2v pre-model masking: lock conditioned frames to clean image
+            if denoise_mask is not None and clean_latent is not None:
+                v_noisy = v_noisy * denoise_mask + clean_latent * (1.0 - denoise_mask)
+
+            # -- build per-patch video timestep (ComfyUI LTXAV.process_timestep)
+            if denoise_mask is not None:
+                _, _, lf, lh, lw = v_noisy.shape
+                mask_vol = denoise_mask.expand(1, 1, lf, lh, lw)
+                per_voxel_sigma = mask_vol * sigma          # 0 for conditioned, sigma for others
+                v_timestep = self._transformer.patchifier.patchify(per_voxel_sigma)[0]
+                v_timestep = v_timestep.squeeze(-1)         # (1, num_patches)
+            else:
+                v_timestep = sigma.expand(v_noisy.shape[0])
+
             a_timestep = sigma.expand(a_noisy.shape[0])
 
             with torch.autocast(device_type=self.device.type, dtype=self.dtype):
                 model_output = self._transformer(
                     x=[v_noisy, a_noisy],
-                    timestep=[timestep, a_timestep],
+                    timestep=[v_timestep, a_timestep],
                     context=context,
                     attention_mask=None,
                     frame_rate=frame_rate,
+                    denoise_mask=denoise_mask,
                 )
 
             if isinstance(model_output, list):
@@ -804,6 +898,10 @@ class LTX2Pipeline(Pipeline):
             v_noisy = v_noisy + v_pred * dt
             a_noisy = a_noisy + a_pred * dt
 
+            # -- i2v post-step masking: re-anchor conditioned frames
+            if denoise_mask is not None and clean_latent is not None:
+                v_noisy = v_noisy * denoise_mask + clean_latent * (1.0 - denoise_mask)
+
             elapsed = time.time() - t0
             logger.info(
                 f"Step {i+1}/{len(sigmas)-1}: sigma={sigma:.4f}->{sigma_next:.4f} ({elapsed:.1f}s) | "
@@ -814,6 +912,66 @@ class LTX2Pipeline(Pipeline):
             )
 
         return v_noisy, a_noisy
+
+    # ------------------------------------------------------------------
+    # VAE encode (for i2v / IC-LoRA guide conditioning)
+    # ------------------------------------------------------------------
+
+    def _encode_image(
+        self,
+        image: torch.Tensor,
+        target_height: int,
+        target_width: int,
+    ) -> torch.Tensor:
+        """Encode image(s) into video latent space using the VideoVAE encoder.
+
+        Args:
+            image: Tensor of shape ``(F, H, W, C)`` in ``[0, 1]`` float range,
+                   or ``(H, W, C)`` for a single frame.
+            target_height: Desired pixel height (must be multiple of 32).
+            target_width: Desired pixel width (must be multiple of 32).
+
+        Returns:
+            Latent tensor of shape ``(1, 128, F_lat, H_lat, W_lat)`` where
+            ``F_lat = (F-1)//8 + 1``, ``H_lat = target_height//32``,
+            ``W_lat = target_width//32``.
+        """
+        if image.ndim == 3:
+            image = image.unsqueeze(0)  # (H, W, C) -> (1, H, W, C)
+
+        # (F, H, W, C) -> (1, C, F, H, W)
+        pixels = image.permute(3, 0, 1, 2).unsqueeze(0)  # C,F,H,W -> 1,C,F,H,W
+
+        # Resize to target resolution
+        if pixels.shape[3] != target_height or pixels.shape[4] != target_width:
+            from einops import rearrange
+            b, c, f, h, w = pixels.shape
+            frames_flat = rearrange(pixels, "b c f h w -> (b f) c h w")
+            frames_flat = torch.nn.functional.interpolate(
+                frames_flat, size=(target_height, target_width), mode="bilinear", align_corners=False,
+            )
+            pixels = rearrange(frames_flat, "(b f) c h w -> b c f h w", b=b, f=f)
+
+        # [0, 1] -> [-1, 1]
+        pixels = pixels * 2.0 - 1.0
+        pixels = pixels[:, :3]  # keep only RGB
+
+        need_move = not self._vaes_on_gpu
+        if need_move:
+            _move_module_to(self._video_vae, self.device)
+        try:
+            pixels = pixels.to(device=self.device, dtype=self.dtype)
+            latent = self._video_vae.encode(pixels)
+            logger.info(
+                f"VAE encode: input={pixels.shape} -> latent={latent.shape} "
+                f"mean={latent.mean().item():.4f} std={latent.std().item():.4f}"
+            )
+        finally:
+            if need_move:
+                _move_module_to(self._video_vae, "cpu")
+                gc.collect()
+                torch.cuda.empty_cache()
+        return latent
 
     # ------------------------------------------------------------------
     # VAE decode

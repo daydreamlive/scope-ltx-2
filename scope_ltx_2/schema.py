@@ -311,3 +311,27 @@ class LTX2Config(BasePipelineConfig):
             order=9, label="Randomize Seed", is_load_param=False
         ),
     )
+
+    # Image-to-video conditioning
+    i2v_image: str | None = Field(
+        default=None,
+        description="Reference image for image-to-video generation. The first frame is conditioned on this image.",
+        json_schema_extra=ui_field_config(
+            order=10, component="image", label="I2V Reference Image",
+            is_load_param=False, category="input",
+        ),
+    )
+
+    i2v_strength: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How strongly the first frame is conditioned on the reference image. "
+            "1.0 = fully conditioned (no noise on reference frame), "
+            "0.0 = no conditioning (pure text-to-video)."
+        ),
+        json_schema_extra=ui_field_config(
+            order=11, label="I2V Strength", is_load_param=False, category="input",
+        ),
+    )

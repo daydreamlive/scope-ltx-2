@@ -183,6 +183,12 @@ class LTX2Config(BasePipelineConfig):
                 "special_tokens_map.json",
             ],
         ),
+        HuggingfaceRepoArtifact(
+            repo_id="Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control",
+            files=[
+                "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
+            ],
+        ),
     ]
 
     produces_audio: ClassVar[bool] = True
@@ -194,7 +200,11 @@ class LTX2Config(BasePipelineConfig):
     min_dimension: ClassVar[int] = 64
     modified: ClassVar[bool] = False
 
-    modes: ClassVar[dict[str, ModeDefaults]] = {"text": ModeDefaults(default=True)}
+    inputs: ClassVar[list[str]] = ["video"]
+    modes: ClassVar[dict[str, ModeDefaults]] = {
+        "text": ModeDefaults(default=True),
+        "video": ModeDefaults(),
+    }
     supports_prompts: ClassVar[bool] = True
 
     lora_merge_strategy: str = Field(
@@ -333,5 +343,21 @@ class LTX2Config(BasePipelineConfig):
         ),
         json_schema_extra=ui_field_config(
             order=11, label="I2V Strength", is_load_param=False, category="input",
+        ),
+    )
+
+    # IC-LoRA guide conditioning strength (video mode)
+    control_strength: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "IC-LoRA guide conditioning strength for video mode. "
+            "1.0 = fully conditioned, 0.0 = no conditioning. "
+            "Input video frames (depth/canny/pose) arrive via the video graph port."
+        ),
+        json_schema_extra=ui_field_config(
+            order=12, label="Control Strength", is_load_param=False,
+            category="input", modes=["video"],
         ),
     )

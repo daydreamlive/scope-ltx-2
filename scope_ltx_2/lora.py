@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,12 @@ def _extract_lora_pairs(
     return pairs
 
 
+def _extract_safetensors_metadata(path: str) -> dict[str, str]:
+    """Read safetensors file-level metadata (not tensor data)."""
+    with safe_open(path, framework="pt") as f:
+        return dict(f.metadata()) if f.metadata() else {}
+
+
 def load_and_merge_loras(
     model: nn.Module,
     lora_configs: list[dict[str, Any]],
@@ -69,7 +76,9 @@ def load_and_merge_loras(
     re-quantized.  The per-tensor scale is updated on the module so the
     existing monkey-patched forward (``_fp8_scaled_forward``) stays correct.
 
-    Returns a list of ``{"path": str, "scale": float}`` for status reporting.
+    Returns a list of dicts with ``path``, ``scale``, and
+    ``reference_downscale_factor`` (extracted from safetensors metadata
+    for IC-LoRA checkpoints; defaults to ``1.0``).
     """
     if not lora_configs:
         return []
@@ -92,6 +101,17 @@ def load_and_merge_loras(
             )
 
         logger.info("Loading LoRA: %s (scale=%.2f)", Path(path).name, scale)
+
+        metadata = _extract_safetensors_metadata(str(path))
+        try:
+            reference_downscale_factor = float(metadata["reference_downscale_factor"])
+            logger.info(
+                "IC-LoRA detected: reference_downscale_factor=%.1f from %s",
+                reference_downscale_factor, Path(path).name,
+            )
+        except (KeyError, ValueError, TypeError):
+            reference_downscale_factor = 1.0
+
         sd = load_file(str(path), device="cpu")
         pairs = _extract_lora_pairs(sd)
         del sd
@@ -119,6 +139,10 @@ def load_and_merge_loras(
             merged += 1
 
         logger.info("Merged %d/%d LoRA weights from %s", merged, len(pairs), Path(path).name)
-        loaded.append({"path": str(path), "scale": scale})
+        loaded.append({
+            "path": str(path),
+            "scale": scale,
+            "reference_downscale_factor": reference_downscale_factor,
+        })
 
     return loaded

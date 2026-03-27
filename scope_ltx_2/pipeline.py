@@ -290,26 +290,31 @@ class LTX2Pipeline(Pipeline):
         logger.info("Loading transformer (FP8, CPU-resident)...")
         self._transformer = load_transformer(transformer_path, device=torch.device("cpu"), dtype=dtype)
 
-        # Step 3b: Auto-include the IC-LoRA Union Control if available
-        IC_LORA_FILENAME = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
-        ic_lora_path = get_model_file_path(
-            f"LTX-2.3-22b-IC-LoRA-Union-Control/{IC_LORA_FILENAME}"
-        )
+        # Step 3b: Merge user LoRA weights (before FFN chunking / streaming setup)
         if loras is None:
             loras = []
-        already_has_ic_lora = any(
-            IC_LORA_FILENAME in (cfg.get("path") or "") for cfg in loras
-        )
-        if ic_lora_path.exists() and not already_has_ic_lora:
-            logger.info(f"Auto-loading IC-LoRA Union Control: {ic_lora_path}")
-            loras = list(loras) + [{"path": str(ic_lora_path), "scale": 1.0}]
-
-        # Step 3c: Merge LoRA weights (before FFN chunking / streaming setup)
         if loras:
             from .lora import load_and_merge_loras
             self.loaded_lora_adapters = load_and_merge_loras(self._transformer, loras)
         else:
             self.loaded_lora_adapters = []
+
+        # Step 3c: Detect IC-LoRA Union Control for deferred merge.
+        # IC-LoRA is NOT merged at init because its weight modifications
+        # interfere with user LoRAs (e.g. style LoRAs) in text-only mode.
+        # It will be merged on first use when video guide input is received.
+        IC_LORA_FILENAME = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
+        ic_lora_path = get_model_file_path(
+            f"LTX-2.3-22b-IC-LoRA-Union-Control/{IC_LORA_FILENAME}"
+        )
+        already_has_ic_lora = any(
+            IC_LORA_FILENAME in (cfg.get("path") or "") for cfg in loras
+        )
+        if ic_lora_path.exists() and not already_has_ic_lora:
+            self._pending_ic_lora = {"path": str(ic_lora_path), "scale": 1.0}
+            logger.info(f"IC-LoRA Union Control available (deferred): {ic_lora_path}")
+        else:
+            self._pending_ic_lora = None
 
         if ffn_chunk_size is not None:
             self._apply_ffn_chunking(ffn_chunk_size)
@@ -414,6 +419,26 @@ class LTX2Pipeline(Pipeline):
     # ------------------------------------------------------------------
     # Model management helpers
     # ------------------------------------------------------------------
+
+    def _merge_ic_lora(self):
+        """Merge the deferred IC-LoRA Union Control into the transformer.
+
+        Called on first use of video guide conditioning. Requires the
+        transformer to be CPU-resident (before streaming setup) and
+        tears down any existing denoising state first.
+        """
+        if self._pending_ic_lora is None:
+            return
+
+        from .lora import load_and_merge_loras
+
+        self._teardown_denoising()
+
+        ic_cfg = self._pending_ic_lora
+        self._pending_ic_lora = None
+        logger.info(f"Merging deferred IC-LoRA: {Path(ic_cfg['path']).name}")
+        merged = load_and_merge_loras(self._transformer, [ic_cfg])
+        self.loaded_lora_adapters.extend(merged)
 
     def _apply_ffn_chunking(self, chunk_size: int):
         for block in self._transformer.transformer_blocks:
@@ -751,8 +776,11 @@ class LTX2Pipeline(Pipeline):
             a.get("reference_downscale_factor", 1.0) > 1.0
             for a in self.loaded_lora_adapters
         )
+        ic_lora_available = has_ic_lora or self._pending_ic_lora is not None
 
-        if video_input is not None and has_ic_lora:
+        if video_input is not None and ic_lora_available:
+            if not has_ic_lora:
+                self._merge_ic_lora()
             logger.info(f"IC-LoRA guide conditioning (strength={control_strength})")
             control_frames = _video_input_to_frames(video_input, self.device, self.dtype)
             logger.info(f"Control frames: {control_frames.shape[0]} frames {control_frames.shape}")

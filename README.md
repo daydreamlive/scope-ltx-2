@@ -9,35 +9,39 @@
 LTX 2.3 is a 22B-parameter DiT (Diffusion Transformer) that generates synchronized video and audio from text prompts. This plugin uses ComfyUI-derived model loading and inference code with [Kijai's separated FP8 checkpoints](https://huggingface.co/Kijai/LTX2.3_comfy), enabling it to run on a single **24GB GPU**.
 
 > [!IMPORTANT]
-> Plugin support is a preview feature in Scope right now and the APIs are subject to breaking change prior to official release.
-> Be sure to be running v0.1.0-beta.3+
+> Plugin support is a preview feature in Scope; APIs may change before a stable release. Use a Scope build that includes plugin support ([manual installation](https://github.com/daydreamlive/scope/tree/main?tab=readme-ov-file#manual-installation)).
 
 ## Features
 
-- **Audio-video generation** from text prompts (synchronized audio + video)
-- **Non-autoregressive** - generates complete clips (33+ frames) at once
-- **Runs on 24GB GPUs** - FP8 quantization baked into checkpoints, CPU-resident transformer with double-buffered weight streaming
-- **8-step distilled inference** - fast generation with predefined sigma schedule
-- **Configurable output** - resolution, frame count, frame rate, seed
+- **Audio–video generation** — synchronized video and audio from text prompts
+- **Modes** — **text** (default) and **video**; video mode supports **IC-LoRA** guide conditioning using a control video (e.g. depth / canny / pose) on the graph **video** input
+- **Image-to-video (I2V)** — optional reference image (`i2v_image`) with adjustable **I2V strength** (`i2v_strength`) to condition the first frame; set strength to `0` for pure text-to-video
+- **LoRA** — **permanent merge at load** into the FP8 transformer (dequantize → merge → requantize); zero runtime LoRA overhead; compatible with block streaming. Additional LoRA files go under your Scope models directory (e.g. `models/lora/`) and are selected via the pipeline **LoRA** UI or `loras` in `/load`
+- **IC-LoRA Union Control** — weights from [Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control) are downloaded with the pipeline; they are merged when you use video-mode guide conditioning (or you can list the safetensors explicitly in `loras`). Use **control strength** (`control_strength`) to blend the guide
+- **Sampling** — default **8-step distilled** Euler schedule; optional schedules: `linear`, `cosine`, `linear_quadratic`, `beta`; configurable **denoising steps** (`num_steps`). Advanced: custom **`sigmas`** list (API) overrides step count and schedule
+- **Output constraints** — height/width snapped to **32**-pixel multiples; frame count snapped to **8×K+1** (minimum 9)
+- **Runs on 24GB GPUs** — FP8 weights in checkpoints, CPU-resident transformer blocks with double-buffered streaming to GPU
+- **Configurable output** — resolution, frame count, frame rate, seed / **randomize seed** per chunk, **FFN chunk size** for memory tuning
 
 ## Requirements
 
 - **VRAM**: ~22GB (24GB GPU recommended, e.g. RTX 4090 / A5000)
   - Gemma 3 12B FP8 text encoder: ~13GB (offloaded after encoding)
   - Transformer 22B FP8: ~23GB total, CPU-resident with block streaming
-  - Video VAE + Audio VAE + Vocoder: ~1GB (GPU-resident)
+  - Video VAE + Audio VAE + vocoder: ~1GB (GPU-resident)
 - **Python**: 3.12+
 - **CUDA**: 12.8+
 
 ## Supported Models
 
-This plugin downloads weights from three HuggingFace repositories:
+Weights are pulled from these Hugging Face repositories:
 
 | Repository | Contents |
 |------------|----------|
-| [Kijai/LTX2.3_comfy](https://huggingface.co/Kijai/LTX2.3_comfy) | Transformer (22B distilled v3 FP8), text projection, video VAE, audio VAE |
+| [Kijai/LTX2.3_comfy](https://huggingface.co/Kijai/LTX2.3_comfy) | Transformer (22B distilled v3 FP8), text projection, video VAE, audio VAE (includes vocoder weights used at decode) |
 | [Comfy-Org/ltx-2](https://huggingface.co/Comfy-Org/ltx-2) | Gemma 3 12B FP8 text encoder |
-| [google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it) | Gemma tokenizer and config files |
+| [google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it) | Gemma tokenizer and config (gated — license required) |
+| [Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control) | IC-LoRA Union Control safetensors for video-mode guide conditioning |
 
 ## Install
 
@@ -63,8 +67,6 @@ DAYDREAM_SCOPE_PREVIEW=1 uv run daydream-scope pipelines
 
 ## Upgrade
 
-Upgrade the plugin to the latest version:
-
 ```bash
 DAYDREAM_SCOPE_PREVIEW=1 uv run daydream-scope install --upgrade git+https://github.com/daydreamlive/scope-ltx-2.git
 ```
@@ -76,35 +78,19 @@ DAYDREAM_SCOPE_PREVIEW=1 uv run daydream-scope install --upgrade git+https://git
 The Gemma tokenizer files are hosted in a **gated** repository. You must accept the license to download them.
 
 > [!IMPORTANT]
-> You must complete these steps while **logged in** to HuggingFace, or downloads will fail with "403 Forbidden" errors.
-
-#### Google Gemma 3 12B
+> Complete these steps while **logged in** to HuggingFace, or downloads will fail with "403 Forbidden" errors.
 
 1. Go to [huggingface.co/google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it)
 2. Click **"Agree and access repository"** to accept Google's Gemma Terms of Use
-3. You may need to:
-   - Verify your HuggingFace account email
-   - Provide your name and affiliation
-   - Acknowledge the usage restrictions
-4. Wait for access approval (usually instant, but can take a few minutes)
+3. You may need to verify email, provide name/affiliation, and acknowledge usage restrictions
+4. Wait for access approval (usually quick)
 
 > [!NOTE]
-> The other two repositories ([Kijai/LTX2.3_comfy](https://huggingface.co/Kijai/LTX2.3_comfy) and [Comfy-Org/ltx-2](https://huggingface.co/Comfy-Org/ltx-2)) are not gated and do not require license acceptance.
-
-> [!NOTE]
-> Gemma models are subject to Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms). Make sure you comply with the terms for your use case.
+> The Kijai, Comfy-Org, and Lightricks repositories listed above are not gated like Gemma. Gemma is subject to Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms).
 
 ### Step 2: Configure HuggingFace Token
 
-Create a HuggingFace access token with **read** permissions:
-
-1. Go to [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-2. Click **"Create new token"**
-3. Give it a name (e.g., "scope-ltx2")
-4. Select **"Read"** access (minimum required)
-5. Click **"Create token"** and copy the token
-
-Set the token as an environment variable:
+Create a HuggingFace access token with **read** permissions at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens), then set:
 
 **Windows Command Prompt:**
 
@@ -112,7 +98,7 @@ Set the token as an environment variable:
 set HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-**Windows Powershell:**
+**Windows PowerShell:**
 
 ```powershell
 $env:HF_TOKEN="hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
@@ -125,23 +111,17 @@ export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 > [!TIP]
-> Add the export command to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) to persist the token across sessions.
+> Add the export to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) to persist the token.
 
 ### Step 3: Run Scope
-
-Start the server:
 
 ```bash
 uv run daydream-scope
 ```
 
-The web frontend will be available at `http://localhost:8000` by default.
+The web UI defaults to `http://localhost:8000`. Select pipeline **`ltx2`** in Settings, or load it via the [API](https://github.com/daydreamlive/scope/blob/main/docs/server.md) ([load pipeline](https://github.com/daydreamlive/scope/blob/main/docs/api/load.md#load-a-pipeline)).
 
-The `ltx2` pipeline will be available in:
-- The frontend under the Pipeline ID dropdown in the Settings panel.
-- The [API](https://github.com/daydreamlive/scope/blob/main/docs/server.md) by [loading the pipeline](https://github.com/daydreamlive/scope/blob/main/docs/api/load.md#load-a-pipeline) using the `ltx2` pipeline ID.
-
-If you are not using the frontend, you can download the model weights first:
+Prefetch weights without the UI:
 
 ```bash
 uv run download_models --pipeline ltx2
@@ -149,21 +129,28 @@ uv run download_models --pipeline ltx2
 
 ### Configuration Options
 
-| Parameter | Default | UI Available | Description |
-|-----------|---------|--------------|-------------|
-| `height` | 384 | ✅ Yes | Output video height in pixels |
-| `width` | 320 | ✅ Yes | Output video width in pixels |
-| `base_seed` | 42 | ✅ Yes | Random seed for reproducible generation |
-| `num_frames` | 129 | ✅ Yes | Number of frames to generate (~1.3 seconds at 24fps) |
-| `randomize_seed` | true | ✅ Yes | Generate new random seed each chunk |
-| `frame_rate` | 25.0 | ⚠️ API only | Output frame rate |
-| `ffn_chunk_size` | 4096 | ⚠️ API only | Chunk size for FFN processing (lower = less memory, more overhead; `null` to disable) |
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `height` / `width` | 384 / 320 | Output size in pixels (snapped to multiples of 32) |
+| `base_seed` | 42 | Base seed when not randomizing |
+| `randomize_seed` | true | New random seed each inference chunk |
+| `num_frames` | 129 | Frame count (snapped to 8×K+1; e.g. 9, 17, …, 129) |
+| `num_steps` | 8 | Euler denoising steps (1–20) |
+| `schedule` | `"distilled"` | Sigma schedule: `distilled`, `linear`, `cosine`, `linear_quadratic`, `beta` |
+| `frame_rate` | 24.0 | Metadata / output frame rate |
+| `lora_merge_strategy` | `"permanent_merge"` | Only `permanent_merge` is supported for this FP8 model |
+| `i2v_image` | — | Optional path or asset for image-to-video first-frame conditioning |
+| `i2v_strength` | 1.0 | 0 = no I2V conditioning, 1 = full first-frame conditioning |
+| `control_strength` | 1.0 | Video mode: IC-LoRA guide strength (0 = off, 1 = full) |
+| `ffn_chunk_size` | 4096 | FFN chunking for memory (smaller = less VRAM, more overhead; `null` disables) |
+| `sigmas` | — | **API:** custom descending sigma list; overrides `num_steps` and `schedule` |
+
+**LoRAs:** Pass `loras` as a list of `{ "path": "...", "scale": 1.0 }` in the `/load` body (paths are typically under your models tree). The IC-LoRA file is downloaded automatically; it is merged when guide video conditioning is used, unless you already included that file in `loras`.
 
 > [!NOTE]
-> Parameters marked "API only" work but don't have UI controls in Scope's main branch.
-> Use the `/load` API endpoint to set these parameters.
+> Which parameters appear in the Scope UI depends on your Scope version. Anything exposed in the pipeline JSON schema can be set via `/load` if needed.
 
-#### Using API-Only Parameters
+#### Example `/load` body
 
 ```bash
 curl -X POST http://localhost:8000/load \
@@ -174,94 +161,66 @@ curl -X POST http://localhost:8000/load \
       "height": 384,
       "width": 320,
       "num_frames": 129,
-      "randomize_seed": true
+      "num_steps": 8,
+      "schedule": "distilled",
+      "randomize_seed": true,
+      "frame_rate": 24.0,
+      "ffn_chunk_size": 4096
     }
   }'
 ```
 
-#### Frame Count Formula
+#### Frame count
 
-LTX 2.3 works best with frame counts following the formula `8×K+1`:
-- 9, 17, 25, 33, 41, 49, 57, 65, ...
+Valid counts follow **8×K+1** (minimum 9): 9, 17, 25, 33, … Other values are snapped to the nearest valid count.
 
-Other values are automatically snapped to the nearest valid count.
+### Memory optimization
 
-### Memory Optimization Tips
-
-1. **Lower resolution** - activations scale with resolution × frames
-2. **Fewer frames** - reduces both latent size and activation memory
-3. **Reduce `ffn_chunk_size`** - smaller chunks use less peak activation memory at the cost of more kernel launches
-4. **Set PYTORCH_CUDA_ALLOC_CONF** - `expandable_segments:True` prevents fragmentation
+1. Lower resolution and/or **fewer frames**
+2. Lower **`ffn_chunk_size`** (e.g. 2048 or 1024)
+3. **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** to reduce fragmentation
 
 ## Limitations
 
-### Current Limitations
+- **No frame-by-frame streaming** — each run produces a full clip; latency is batch generation time, not interactive streaming
+- **LoRA strategy** — **permanent merge only** for FP8 (no runtime PEFT path for this pipeline)
+- **Quantization** — transformer FP8 is fixed by the published checkpoint; there is no separate “pick your dtype” mode in-plugin
 
-- **No real-time streaming** - LTX 2.3 generates complete clips, not frame-by-frame
-- **No image conditioning** - text-to-video only (image conditioning planned)
-- **No LoRA support** - planned for future release
-
-### Scope Main Branch Limitations
-
-These features work in the plugin but lack UI controls in Scope's main branch:
-
-| Feature | Status | Workaround |
-|---------|--------|------------|
-| `num_frames` slider | No UI | Use API to set value |
-| `randomize_seed` toggle | No UI | Use API to set value |
-| `ffn_chunk_size` control | No UI | Use API to set value |
-| Fixed FPS playback | Partial | Video generated correctly, playback may vary |
+Exact Scope UI coverage for every parameter can lag the schema; use **`/load`** when a control is not in the UI yet.
 
 ## Architecture
 
-LTX 2.3 uses a DiT (Diffusion Transformer) architecture with standalone ComfyUI-adapted inference code:
+- **Gemma 3 12B FP8** text encoder, aggregate embedding projection
+- **22B** transformer for joint audio–video denoising (FP8 scaled matmul where applicable)
+- **Video VAE** — 32× spatial, 8× temporal downsampling
+- **Audio VAE + vocoder** — mel decode to waveform (aligned with ComfyUI-style audio stack)
+- **Euler sampling** with configurable sigma schedules; default distilled 8-step schedule when `num_steps` is 8 and `schedule` is `distilled`
+- **CPU→GPU block streaming** — transformer blocks in pinned host memory, double-buffered async copies during denoising
 
-- **Gemma 3 12B FP8** text encoder for prompt understanding, with per-token RMS normalization across all 49 layers and aggregate embedding projection
-- **22B parameter** transformer for joint audio-video denoising, loaded with FP8 scaled matmul (`torch._scaled_mm`) for quantized layers
-- **Video VAE** for latent space decoding (32x spatial, 8x temporal downsampling)
-- **Audio VAE + Vocoder** for synchronized audio generation (mel spectrogram decoding with bandwidth extension)
-- **8-step distilled Euler sampling** with predefined sigma schedule
-- **CPU-to-GPU weight streaming** - transformer blocks are CPU-resident in pinned memory and double-buffered onto GPU via async CUDA streams during inference, allowing the full 22B model to run within 24GB VRAM
-
-For more details, see the [official LTX-2 documentation](https://github.com/Lightricks/LTX-2).
+Details: [Lightricks LTX-2](https://github.com/Lightricks/LTX-2).
 
 ## Troubleshooting
 
-### Out of Memory (OOM)
+### Out of memory (OOM)
 
-If you encounter OOM errors:
-1. Reduce `num_frames` (try 33 instead of 129)
-2. Reduce resolution (try 320x320)
-3. Reduce `ffn_chunk_size` (try 2048 or 1024)
-4. Ensure no other GPU processes are running
+1. Reduce `num_frames` (e.g. 33 instead of 129)
+2. Reduce resolution
+3. Reduce `ffn_chunk_size`
+4. Close other GPU workloads
 
-### Model Download Fails
+### Model download fails
 
-**"403 Forbidden" or "Access to model is restricted":**
-- You haven't accepted the Gemma license agreement on HuggingFace
-- Go to [google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it) while logged in and click "Agree and access repository"
+**403 / access restricted (Gemma):** accept the license at [google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it) while logged in.
 
-**"Invalid token" or "Token not found":**
-- Verify `HF_TOKEN` environment variable is set correctly
-- Regenerate your token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-- Ensure the token has at least "Read" permissions
+**Invalid token:** set `HF_TOKEN` correctly; token needs at least read access.
 
-**"Repository not found" for Gemma:**
-- Gemma access may require email verification on HuggingFace
-- Check your email for a verification link from HuggingFace
-- Some Gemma models require manual approval (usually instant)
+**Repository not found:** confirm HF account email verification if required.
 
-**General tips:**
-- Check network connectivity
-- Try `huggingface-cli login` to verify your token works
-- Ensure you're using the correct model names (case-sensitive)
+**General:** check network; `huggingface-cli login` to verify the token.
 
-### Slow Generation
+### Slow generation
 
-LTX 2.3 generates complete clips rather than streaming frames. Generation time depends on:
-- Number of frames
-- Resolution
-- GPU performance and CPU-to-GPU transfer bandwidth (weight streaming)
+Generation time scales with frames, resolution, and GPU/PCIe throughput (weight streaming).
 
 ## License
 
@@ -269,7 +228,7 @@ This plugin is licensed under the same terms as the [LTX-2 model](https://github
 
 ## Acknowledgments
 
-- [Lightricks](https://www.lightricks.com/) for the LTX-2 model
-- [Kijai](https://huggingface.co/Kijai) for the separated ComfyUI-format FP8 checkpoints
-- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) for the model loading and VAE implementations this plugin adapts
-- [Daydream](https://daydreamlive.ai/) for the Scope platform
+- [Lightricks](https://www.lightricks.com/) for LTX-2
+- [Kijai](https://huggingface.co/Kijai) for separated Comfy-format FP8 checkpoints
+- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) for patterns this plugin adapts
+- [Daydream](https://daydream.live/) for Scope

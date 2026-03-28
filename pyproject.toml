@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "scope-ltx-2"
 version = "0.3.0"
@@ -9,7 +13,11 @@ dependencies = [
     "safetensors",
     "einops",
     "transformers",
+    "sentencepiece",
 ]
+
+[tool.setuptools.package-data]
+scope_ltx_2 = ["gemma_config/*.json"]
 
 [project.entry-points.scope]
 scope-ltx-2 = "scope_ltx_2"

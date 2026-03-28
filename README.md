@@ -39,9 +39,10 @@ Weights are pulled from these Hugging Face repositories:
 | Repository | Contents |
 |------------|----------|
 | [Kijai/LTX2.3_comfy](https://huggingface.co/Kijai/LTX2.3_comfy) | Transformer (22B distilled v3 FP8), text projection, video VAE, audio VAE (includes vocoder weights used at decode) |
-| [Comfy-Org/ltx-2](https://huggingface.co/Comfy-Org/ltx-2) | Gemma 3 12B FP8 text encoder |
-| [google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it) | Gemma tokenizer and config (gated — license required) |
+| [Comfy-Org/ltx-2](https://huggingface.co/Comfy-Org/ltx-2) | Gemma 3 12B FP8 text encoder (includes embedded SentencePiece tokenizer) |
 | [Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control) | IC-LoRA Union Control safetensors for video-mode guide conditioning |
+
+The Gemma model architecture config is bundled with this plugin — no separate download from `google/gemma-3-12b-it` is needed. The tokenizer is extracted at runtime from the FP8 checkpoint's embedded `spiece_model` tensor.
 
 ## Install
 
@@ -73,22 +74,7 @@ DAYDREAM_SCOPE_PREVIEW=1 uv run daydream-scope install --upgrade git+https://git
 
 ## Usage
 
-### Step 1: Accept Gemma License on HuggingFace
-
-The Gemma tokenizer files are hosted in a **gated** repository. You must accept the license to download them.
-
-> [!IMPORTANT]
-> Complete these steps while **logged in** to HuggingFace, or downloads will fail with "403 Forbidden" errors.
-
-1. Go to [huggingface.co/google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it)
-2. Click **"Agree and access repository"** to accept Google's Gemma Terms of Use
-3. You may need to verify email, provide name/affiliation, and acknowledge usage restrictions
-4. Wait for access approval (usually quick)
-
-> [!NOTE]
-> The Kijai, Comfy-Org, and Lightricks repositories listed above are not gated like Gemma. Gemma is subject to Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms).
-
-### Step 2: Configure HuggingFace Token
+### Step 1: Configure HuggingFace Token
 
 Create a HuggingFace access token with **read** permissions at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens), then set:
 
@@ -113,7 +99,7 @@ export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 > [!TIP]
 > Add the export to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) to persist the token.
 
-### Step 3: Run Scope
+### Step 2: Run Scope
 
 ```bash
 uv run daydream-scope
@@ -209,8 +195,6 @@ Details: [Lightricks LTX-2](https://github.com/Lightricks/LTX-2).
 4. Close other GPU workloads
 
 ### Model download fails
-
-**403 / access restricted (Gemma):** accept the license at [google/gemma-3-12b-it](https://huggingface.co/google/gemma-3-12b-it) while logged in.
 
 **Invalid token:** set `HF_TOKEN` correctly; token needs at least read access.
 

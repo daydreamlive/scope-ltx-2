@@ -207,7 +207,6 @@ class LTX2Pipeline(Pipeline):
         video_vae_path: str | None = None,
         audio_vae_path: str | None = None,
         gemma_model_path: str | None = None,
-        gemma_tokenizer_path: str | None = None,
         ffn_chunk_size: int | None = 4096,
         loras: list[dict] | None = None,
         **kwargs,
@@ -261,21 +260,20 @@ class LTX2Pipeline(Pipeline):
             if fp8_path.exists():
                 gemma_model_path = str(fp8_path)
             else:
-                logger.warning("FP8 Gemma not found, falling back to bf16 from gemma-3-12b-it")
-                gemma_model_path = str(get_model_file_path("gemma-3-12b-it"))
-        if gemma_tokenizer_path is None:
-            gemma_tokenizer_path = str(get_model_file_path("gemma-3-12b-it"))
+                raise FileNotFoundError(
+                    f"FP8 Gemma checkpoint not found at {fp8_path}. "
+                    "Download it from Comfy-Org/ltx-2 on HuggingFace."
+                )
 
         logger.info(f"Transformer: {transformer_path}")
         logger.info(f"Text projection: {text_projection_path}")
         logger.info(f"Gemma: {gemma_model_path}")
-        logger.info(f"Gemma tokenizer: {gemma_tokenizer_path}")
 
-        # Step 1: Load Gemma on GPU (FP8 ~13GB, bf16 ~23GB)
+        # Step 1: Load Gemma on GPU (FP8 ~13GB)
         gemma_device = device if Path(gemma_model_path).suffix == ".safetensors" else torch.device("cpu")
         logger.info(f"Loading Gemma 3 12B on {gemma_device}...")
         self._text_encoder, self._tokenizer = load_gemma_text_encoder(
-            gemma_model_path, gemma_tokenizer_path, device=gemma_device, dtype=dtype
+            gemma_model_path, device=gemma_device, dtype=dtype
         )
         self._text_encoder_on_gpu = True
         _log_gpu_memory("gemma loaded")

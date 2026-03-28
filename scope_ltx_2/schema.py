@@ -174,16 +174,6 @@ class LTX2Config(BasePipelineConfig):
             ],
         ),
         HuggingfaceRepoArtifact(
-            repo_id="google/gemma-3-12b-it",
-            files=[
-                "config.json",
-                "tokenizer.json",
-                "tokenizer.model",
-                "tokenizer_config.json",
-                "special_tokens_map.json",
-            ],
-        ),
-        HuggingfaceRepoArtifact(
             repo_id="Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control",
             files=[
                 "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",

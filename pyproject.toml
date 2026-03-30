@@ -16,9 +16,6 @@ dependencies = [
     "sentencepiece",
 ]
 
-[tool.setuptools.package-data]
-scope_ltx_2 = ["gemma_config/*.json"]
-
 [project.entry-points.scope]
 scope-ltx-2 = "scope_ltx_2"
 

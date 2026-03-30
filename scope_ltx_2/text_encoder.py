@@ -19,7 +19,39 @@ from safetensors.torch import load_file
 
 logger = logging.getLogger(__name__)
 
-GEMMA_CONFIG_DIR = Path(__file__).parent / "gemma_config"
+# Gemma 3 12B architecture config embedded directly to avoid packaging
+# issues with non-Python data files.  Source: google/gemma-3-12b-it config.json
+_GEMMA3_CONFIG_DICT: dict = {
+    "architectures": ["Gemma3ForConditionalGeneration"],
+    "boi_token_index": 255999,
+    "eoi_token_index": 256000,
+    "eos_token_id": [1, 106],
+    "image_token_index": 262144,
+    "initializer_range": 0.02,
+    "mm_tokens_per_image": 256,
+    "model_type": "gemma3",
+    "text_config": {
+        "hidden_size": 3840,
+        "intermediate_size": 15360,
+        "model_type": "gemma3_text",
+        "num_attention_heads": 16,
+        "num_hidden_layers": 48,
+        "num_key_value_heads": 8,
+        "rope_scaling": {"factor": 8.0, "rope_type": "linear"},
+        "sliding_window": 1024,
+    },
+    "torch_dtype": "bfloat16",
+    "vision_config": {
+        "hidden_size": 1152,
+        "image_size": 896,
+        "intermediate_size": 4304,
+        "model_type": "siglip_vision_model",
+        "num_attention_heads": 16,
+        "num_hidden_layers": 27,
+        "patch_size": 14,
+        "vision_use_head": False,
+    },
+}
 
 
 def _extract_tokenizer_from_safetensors(fp8_sd: dict[str, torch.Tensor]) -> "GemmaTokenizer":
@@ -50,35 +82,27 @@ def _extract_tokenizer_from_safetensors(fp8_sd: dict[str, torch.Tensor]) -> "Gem
 
 def load_gemma_text_encoder(
     gemma_model_path: str | Path,
-    config_path: str | Path | None = None,
     device: torch.device = torch.device("cuda"),
     dtype: torch.dtype = torch.bfloat16,
 ):
     """Load Gemma 3 12B text encoder, optionally with FP8 weights.
 
     If gemma_model_path points to a single .safetensors file (e.g. the FP8
-    checkpoint from Comfy-Org), the model architecture is loaded from
-    config_path and the tokenizer is extracted from the embedded spiece_model
-    tensor inside the checkpoint.  No external tokenizer download is needed.
+    checkpoint from Comfy-Org), the model architecture is constructed from
+    the embedded config and the tokenizer is extracted from the spiece_model
+    tensor inside the checkpoint.  No external downloads are needed.
 
     If gemma_model_path points to a directory, it's loaded directly via
     from_pretrained (the directory must contain weights + tokenizer files).
 
     Args:
         gemma_model_path: Path to FP8 .safetensors file OR model directory
-        config_path: Directory containing config.json for model architecture.
-                     Defaults to the bundled gemma_config/ shipped with this
-                     plugin.
         device: Target device
         dtype: Compute dtype for non-quantized layers
 
     Returns (model, tokenizer).
     """
     gemma_model_path = Path(gemma_model_path)
-    if config_path is None:
-        config_path = GEMMA_CONFIG_DIR
-    else:
-        config_path = Path(config_path)
 
     logger.info(f"Loading Gemma 3 12B from: {gemma_model_path}")
 
@@ -86,7 +110,7 @@ def load_gemma_text_encoder(
         logger.info("Loading FP8 Gemma from single safetensors file...")
 
         from transformers import Gemma3ForCausalLM, Gemma3ForConditionalGeneration
-        full_config = Gemma3ForConditionalGeneration.config_class.from_pretrained(str(config_path))
+        full_config = Gemma3ForConditionalGeneration.config_class.from_dict(_GEMMA3_CONFIG_DICT)
         text_config = full_config.text_config
         with torch.device("meta"):
             model = Gemma3ForCausalLM(text_config)

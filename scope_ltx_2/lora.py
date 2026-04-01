@@ -11,7 +11,6 @@ avoiding precision loss from intermediate quantization steps.
 """
 
 import logging
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +95,10 @@ def load_and_merge_loras(
     before a single FP8 requantization, avoiding precision loss from
     intermediate quantization steps when combining multiple LoRAs.
 
+    Processing is done per-layer to keep peak memory low: only the LoRA
+    A/B matrices (~1-3 GB) and one float32 weight copy at a time are
+    held, rather than materialising all full-size deltas up front.
+
     Args:
         model: The transformer model to merge into.
         lora_configs: List of LoRA config dicts with ``path`` and ``scale``.
@@ -122,8 +125,9 @@ def load_and_merge_loras(
         }
     loaded: list[dict[str, Any]] = []
 
-    # Phase 1: collect all deltas per layer across all LoRA files
-    layer_deltas: dict[str, list[torch.Tensor]] = defaultdict(list)
+    # Phase 1: load all LoRA files and extract A/B pairs (lightweight —
+    # only the low-rank matrices are kept, not full-size deltas).
+    all_lora_data: list[tuple[dict[str, dict[str, Any]], float]] = []
 
     for cfg in lora_configs:
         path = cfg.get("path")
@@ -151,27 +155,24 @@ def load_and_merge_loras(
         pairs = _extract_lora_pairs(sd)
         del sd
 
-        matched = 0
-        for model_key, info in pairs.items():
-            if model_key not in linear_modules:
-                continue
+        matched = sum(1 for k in pairs if k in linear_modules)
+        logger.info("Loaded %d/%d LoRA pairs from %s", matched, len(pairs), Path(path).name)
 
-            lora_A, lora_B = info["lora_A"].float(), info["lora_B"].float()
-            alpha_factor = (info["alpha"] / info["rank"]) if info["alpha"] is not None else 1.0
-            delta = (lora_B @ lora_A) * (alpha_factor * scale)
-            layer_deltas[model_key].append(delta)
-            matched += 1
-
-        logger.info("Collected %d/%d LoRA deltas from %s", matched, len(pairs), Path(path).name)
+        all_lora_data.append((pairs, scale))
         loaded.append({
             "path": str(path),
             "scale": scale,
             "reference_downscale_factor": reference_downscale_factor,
         })
 
-    # Phase 2: apply accumulated deltas with single requantization per layer
+    # Phase 2: merge per-layer — compute deltas on the fly from the A/B
+    # matrices so only one float32 weight copy is live at a time.
+    all_keys: set[str] = set()
+    for pairs, _ in all_lora_data:
+        all_keys.update(k for k in pairs if k in linear_modules)
+
     merged = 0
-    for model_key, deltas in layer_deltas.items():
+    for model_key in all_keys:
         module = linear_modules[model_key]
 
         if save_snapshot is not None and model_key not in save_snapshot:
@@ -183,22 +184,33 @@ def load_and_merge_loras(
                 entry["fp8_weight_scale"] = module._fp8_weight_scale.clone()
             save_snapshot[model_key] = entry
 
-        if module.weight.dtype == torch.float8_e4m3fn:
+        is_fp8 = module.weight.dtype == torch.float8_e4m3fn
+        if is_fp8:
             ws = getattr(module, "_fp8_weight_scale", torch.tensor(1.0))
             w = module.weight.data.float() * ws.float()
-            for delta in deltas:
-                w += delta
+        else:
+            w = module.weight.data.float()
+
+        for pairs, scale in all_lora_data:
+            info = pairs.get(model_key)
+            if info is None:
+                continue
+            lora_A, lora_B = info["lora_A"].float(), info["lora_B"].float()
+            alpha_factor = (info["alpha"] / info["rank"]) if info["alpha"] is not None else 1.0
+            w += (lora_B @ lora_A) * (alpha_factor * scale)
+
+        if is_fp8:
             amax = w.abs().amax().clamp(min=1e-12)
             new_ws = amax / _FP8_MAX
             module.weight.data = (w / new_ws).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
             module._fp8_weight_scale = new_ws
         else:
-            w = module.weight.data.float()
-            for delta in deltas:
-                w += delta
             module.weight.data = w.to(module.weight.dtype)
+        del w
 
         merged += 1
+
+    del all_lora_data
 
     logger.info(
         "Batch-merged %d layers from %d LoRA file(s)",

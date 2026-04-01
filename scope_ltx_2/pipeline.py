@@ -3,18 +3,29 @@
 Uses Kijai's separated ComfyUI-format checkpoints (distilled v3 FP8) with
 a standalone inference implementation adapted from ComfyUI's lightricks code.
 
-Memory Management (24GB GPU):
-    - Gemma 3 12B FP8 text encoder: ~13GB on GPU, offloaded after encoding
-    - Text projection (aggregate embeds): ~1.5GB, runs on GPU briefly
-    - Transformer (22B FP8): ~23GB total, CPU-resident. Scaffold (norms,
+Memory Management — Standard Mode (24 GB GPU):
+    - Gemma 3 12B FP8 text encoder: ~13 GB on GPU, offloaded after encoding
+    - Text projection (aggregate embeds): ~1.5 GB, runs on GPU briefly
+    - Transformer (22B FP8): ~23 GB total, CPU-resident.  Scaffold (norms,
       embeddings, etc.) persists on GPU; transformer blocks streamed from
       CPU with double-buffered async transfers and prefetching.
-    - VAEs: kept resident on GPU (~1GB total). The streaming config
+    - VAEs: kept resident on GPU (~1 GB total).  The streaming config
       automatically accounts for their memory at setup time.
     - Between generations: streaming state (hooks, pinned memory) persists.
       Resident blocks are temporarily offloaded for VAE decode, then
       reloaded by pre-forward hooks on the next denoising pass.
     - Full teardown only when text encoder needs to reload (prompt change).
+
+Memory Management — High-VRAM Mode (≥ ~30 GB GPU, auto-detected):
+    - Gemma, VAEs, and text projection stay permanently on GPU.
+    - No model swapping on prompt changes → eliminates multi-second pauses.
+    - Streaming state persists across prompt changes (no teardown/rebuild).
+    - On ≥ 40 GB GPUs, all transformer blocks fit resident alongside the
+      text encoder → zero streaming overhead and zero swap delays.
+    - On 48-80 GB GPUs, resident blocks can also stay on GPU during VAE
+      decode, removing the offload/reload cycle entirely.
+    - Controlled by the ``keep_models_resident`` config option (auto /
+      True / False).
 
 Audio Support:
     LTX 2.3 natively supports synchronized audio-video generation.
@@ -209,6 +220,7 @@ class LTX2Pipeline(Pipeline):
         gemma_model_path: str | None = None,
         ffn_chunk_size: int | None = 4096,
         loras: list[dict] | None = None,
+        keep_models_resident: bool | None = None,
         **kwargs,
     ):
         from .model_loader import load_transformer
@@ -332,6 +344,10 @@ class LTX2Pipeline(Pipeline):
         self._streaming_state = None
         self._vaes_on_gpu = False
 
+        # Step 5: Determine VRAM strategy — on high-VRAM GPUs, keep text
+        # encoder and VAEs permanently on GPU to avoid swap delays.
+        self._init_vram_strategy(keep_models_resident)
+
         logger.info(f"LTX 2.3 pipeline loaded in {time.time() - start:.1f}s")
         _log_gpu_memory("all loaded")
 
@@ -418,6 +434,77 @@ class LTX2Pipeline(Pipeline):
     # Model management helpers
     # ------------------------------------------------------------------
 
+    def _init_vram_strategy(self, override: bool | None = None) -> None:
+        """Decide whether to keep the text encoder and VAEs on GPU permanently.
+
+        On high-VRAM GPUs the text encoder (~13 GB) and VAEs (~1 GB) can stay
+        resident alongside the transformer streaming budget.  This eliminates
+        multi-second pauses when the prompt changes (no Gemma load/offload) or
+        when VAE decode starts (no block offload cycle).
+
+        The auto-detection threshold is:
+            gemma + vaes + scaffold/safety(5 GB) + 50 % of transformer blocks
+        which works out to roughly 30-32 GB for the standard LTX 2.3 model set.
+        """
+        if not torch.cuda.is_available():
+            self._high_vram = False
+            self._skip_blocks_offload_for_decode = False
+            return
+
+        if override is not None:
+            self._high_vram = override
+        else:
+            _, total_vram = torch.cuda.mem_get_info(self.device)
+            total_vram_gb = total_vram / 1024**3
+
+            gemma_gb = sum(
+                p.numel() * p.element_size() for p in self._text_encoder.parameters()
+            ) / 1024**3
+            vae_gb = sum(
+                sum(p.numel() * p.element_size() for p in m.parameters())
+                for m in (self._video_vae, self._audio_vae, self._vocoder)
+            ) / 1024**3
+
+            from .weight_streaming import estimate_block_memory
+            blocks = self._transformer.transformer_blocks
+            blocks_gb = sum(estimate_block_memory(b) for b in blocks) / 1024**3
+
+            scaffold_safety_gb = 5.0
+            threshold = gemma_gb + vae_gb + scaffold_safety_gb + blocks_gb * 0.5
+
+            self._high_vram = total_vram_gb >= threshold
+            logger.info(
+                f"VRAM strategy: {total_vram_gb:.1f} GB total, "
+                f"threshold={threshold:.1f} GB "
+                f"(gemma={gemma_gb:.1f}, vaes={vae_gb:.1f}, blocks={blocks_gb:.1f}), "
+                f"high_vram={self._high_vram}"
+            )
+
+        # When high-VRAM is active we can also skip offloading resident
+        # transformer blocks before VAE decode — but only when there is enough
+        # headroom for the decoder activations (~3-5 GB).
+        if self._high_vram:
+            _, total_vram = torch.cuda.mem_get_info(self.device)
+            total_vram_gb = total_vram / 1024**3
+            all_params_gb = sum(
+                p.numel() * p.element_size()
+                for m in (self._text_encoder, self._text_projection,
+                          self._transformer, self._video_vae,
+                          self._audio_vae, self._vocoder)
+                for p in m.parameters()
+            ) / 1024**3
+            self._skip_blocks_offload_for_decode = (total_vram_gb - all_params_gb) >= 3.0
+        else:
+            self._skip_blocks_offload_for_decode = False
+
+        if self._high_vram:
+            logger.info(
+                "High-VRAM mode active — text encoder and VAEs will stay on GPU. "
+                f"skip_blocks_offload_for_decode={self._skip_blocks_offload_for_decode}"
+            )
+            self._move_vaes_to_gpu()
+            self._text_projection.to(self.device)
+
     def _merge_ic_lora(self):
         """Merge the deferred IC-LoRA Union Control into the transformer.
 
@@ -447,7 +534,7 @@ class LTX2Pipeline(Pipeline):
         logger.info(f"FFN chunking applied with chunk_size={chunk_size}")
 
     def _offload_text_encoder(self):
-        if not self._text_encoder_on_gpu:
+        if self._high_vram or not self._text_encoder_on_gpu:
             return
         logger.info("Offloading Gemma to CPU...")
         _move_module_to(self._text_encoder, "cpu")
@@ -482,7 +569,7 @@ class LTX2Pipeline(Pipeline):
 
     def _offload_vaes(self):
         """Offload all VAE models to CPU to free VRAM for text encoder."""
-        if not self._vaes_on_gpu:
+        if self._high_vram or not self._vaes_on_gpu:
             return
         logger.info("Offloading VAEs to CPU...")
         _move_module_to(self._video_vae, "cpu")
@@ -659,6 +746,8 @@ class LTX2Pipeline(Pipeline):
 
         # =================================================================
         # Text encoding (Gemma FP8 on GPU -> offload -> connectors)
+        # In high-VRAM mode, Gemma / VAEs / text_projection stay on GPU
+        # so this path only runs the forward passes — no model swapping.
         # =================================================================
         if self._cached_prompt_text == prompt_text and self._cached_context is not None:
             context = self._cached_context
@@ -666,9 +755,10 @@ class LTX2Pipeline(Pipeline):
         else:
             logger.info(f"Encoding prompt: {prompt_text[:80]}...")
 
-            # Gemma needs ~13 GB — free everything else first
-            self._teardown_denoising()
-            self._offload_vaes()
+            if not self._high_vram:
+                # Gemma needs ~13 GB — free everything else first
+                self._teardown_denoising()
+                self._offload_vaes()
 
             self._load_text_encoder()
 
@@ -683,15 +773,18 @@ class LTX2Pipeline(Pipeline):
 
             self._offload_text_encoder()
 
-            self._text_projection.to(self.device)
+            if not self._high_vram:
+                self._text_projection.to(self.device)
             projected = self._text_projection(all_layer_hiddens)
-            self._text_projection.to("cpu")
+            if not self._high_vram:
+                self._text_projection.to("cpu")
             del all_layer_hiddens
             logger.info(f"Text projection done: {projected.shape}")
 
             self._move_connectors_to_gpu()
             context = self._transformer.preprocess_text_embeds(projected, unprocessed=True)
-            self._move_connectors_to_cpu()
+            if not self._high_vram:
+                self._move_connectors_to_cpu()
 
             del projected
             gc.collect()
@@ -835,10 +928,10 @@ class LTX2Pipeline(Pipeline):
                 "frame_rate": frame_rate,
             }
 
-        # Offload resident blocks to free VRAM for VAE decode.
-        # Streaming state (hooks, pinned memory, scaffold) persists — resident
-        # blocks will be reloaded by pre-forward hooks on the next denoising pass.
-        self._free_blocks_for_decode()
+        # Offload resident blocks to free VRAM for VAE decode (skipped in
+        # high-VRAM mode when there is enough headroom for decode activations).
+        if not self._skip_blocks_offload_for_decode:
+            self._free_blocks_for_decode()
 
         # =================================================================
         # VAE decode

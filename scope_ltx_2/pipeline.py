@@ -307,25 +307,18 @@ class LTX2Pipeline(Pipeline):
 
         # Step 3c: Build module map before FFN chunking (so LoRA keys
         # match the original module paths) and merge user LoRA weights.
-        # When IC-LoRA is also available, snapshot original weights so
-        # we can restore + batch re-merge all LoRAs in a single float32
-        # pass later, avoiding FP8 quantization compounding.
-        self._user_lora_configs = list(loras)
         self._linear_module_map = {
             name: mod for name, mod in self._transformer.named_modules()
             if isinstance(mod, torch.nn.Linear)
         }
-        snapshot = {} if (loras and self._pending_ic_lora is not None) else None
         if loras:
             from .lora import load_and_merge_loras
             self.loaded_lora_adapters = load_and_merge_loras(
                 self._transformer, loras,
                 linear_modules=self._linear_module_map,
-                save_snapshot=snapshot,
             )
         else:
             self.loaded_lora_adapters = []
-        self._original_weights = snapshot
 
         if ffn_chunk_size is not None:
             self._apply_ffn_chunking(ffn_chunk_size)
@@ -411,8 +404,6 @@ class LTX2Pipeline(Pipeline):
         self._cached_context = None
         self._cached_prompt_text = None
         self._streaming_state = None
-        self._original_weights = None
-        self._user_lora_configs = None
         self._linear_module_map = None
 
         gc.collect()
@@ -435,37 +426,27 @@ class LTX2Pipeline(Pipeline):
     # ------------------------------------------------------------------
 
     def _merge_ic_lora(self):
-        """Merge IC-LoRA Union Control into the transformer.
+        """Merge the deferred IC-LoRA Union Control into the transformer.
 
-        If user LoRAs were previously merged, restores original weights
-        and re-merges all LoRAs (user + IC) in a single float32 pass
-        to avoid FP8 quantization compounding that washes out effects.
+        Called on first use of video guide conditioning.  Only the
+        IC-LoRA layers (~480) are merged on top of any previously merged
+        user LoRAs, keeping the on-demand cost low (~30-40 s).
         """
         if self._pending_ic_lora is None:
             return
 
-        from .lora import load_and_merge_loras, restore_original_weights
+        from .lora import load_and_merge_loras
 
         self._teardown_denoising()
 
         ic_cfg = self._pending_ic_lora
         self._pending_ic_lora = None
-        all_configs = self._user_lora_configs + [ic_cfg]
-
-        if self._original_weights:
-            logger.info("Restoring original weights for single-pass LoRA re-merge")
-            restore_original_weights(self._original_weights)
-            self._original_weights = None
-
-        logger.info(
-            "Merging %d LoRA(s) in single pass: %s",
-            len(all_configs),
-            ", ".join(Path(c["path"]).name for c in all_configs),
-        )
-        self.loaded_lora_adapters = load_and_merge_loras(
-            self._transformer, all_configs,
+        logger.info(f"Merging deferred IC-LoRA: {Path(ic_cfg['path']).name}")
+        merged = load_and_merge_loras(
+            self._transformer, [ic_cfg],
             linear_modules=self._linear_module_map,
         )
+        self.loaded_lora_adapters.extend(merged)
 
     def _apply_ffn_chunking(self, chunk_size: int):
         for block in self._transformer.transformer_blocks:

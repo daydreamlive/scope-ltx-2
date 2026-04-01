@@ -69,25 +69,10 @@ def _extract_safetensors_metadata(path: str) -> dict[str, str]:
         return dict(f.metadata()) if f.metadata() else {}
 
 
-def restore_original_weights(snapshot: dict[str, dict[str, Any]]) -> None:
-    """Restore original weights from a snapshot created during LoRA merge.
-
-    Uses stored module references directly, so this works even after
-    FFN chunking changes the module hierarchy paths.
-    """
-    for name, entry in snapshot.items():
-        module = entry["module"]
-        module.weight.data.copy_(entry["weight"])
-        if "fp8_weight_scale" in entry:
-            module._fp8_weight_scale = entry["fp8_weight_scale"].clone()
-    logger.info("Restored original weights for %d layers", len(snapshot))
-
-
 def load_and_merge_loras(
     model: nn.Module,
     lora_configs: list[dict[str, Any]],
     linear_modules: dict[str, nn.Linear] | None = None,
-    save_snapshot: dict | None = None,
 ) -> list[dict[str, Any]]:
     """Load LoRA files and permanently merge weights into *model*.
 
@@ -106,10 +91,6 @@ def load_and_merge_loras(
             LoRA keys are matched against these names instead of the
             current ``model.named_modules()`` hierarchy (useful when FFN
             chunking has altered the module paths after init).
-        save_snapshot: If provided (empty dict), original weights for
-            each modified layer are saved *before* applying deltas,
-            enabling later restoration via ``restore_original_weights``
-            for a clean single-pass re-merge.
 
     Returns a list of dicts with ``path``, ``scale``, and
     ``reference_downscale_factor`` per merged LoRA.
@@ -174,15 +155,6 @@ def load_and_merge_loras(
     merged = 0
     for model_key in all_keys:
         module = linear_modules[model_key]
-
-        if save_snapshot is not None and model_key not in save_snapshot:
-            entry: dict[str, Any] = {
-                "module": module,
-                "weight": module.weight.data.clone(),
-            }
-            if hasattr(module, "_fp8_weight_scale"):
-                entry["fp8_weight_scale"] = module._fp8_weight_scale.clone()
-            save_snapshot[model_key] = entry
 
         is_fp8 = module.weight.dtype == torch.float8_e4m3fn
         if is_fp8:

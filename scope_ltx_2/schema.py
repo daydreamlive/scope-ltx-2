@@ -294,6 +294,22 @@ class LTX2Config(BasePipelineConfig):
 
     frame_rate: float = 24.0
 
+    # VRAM strategy: keep text encoder + VAEs on GPU to avoid swap delays
+    keep_models_resident: bool | None = Field(
+        default=None,
+        description=(
+            "Keep the text encoder and VAEs permanently on GPU to eliminate "
+            "model-swap delays when changing prompts or decoding audio/video. "
+            "When None (default), auto-detected based on available VRAM — "
+            "enabled when the GPU has enough memory to hold all models alongside "
+            "the transformer streaming budget. Set True to force on (requires "
+            "~30+ GB VRAM), or False to force the standard offloading behaviour."
+        ),
+        json_schema_extra=ui_field_config(
+            order=8, label="Keep Models in VRAM", is_load_param=True
+        ),
+    )
+
     # FFN chunking for memory-efficient inference
     ffn_chunk_size: int | None = Field(
         default=4096,

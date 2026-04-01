@@ -288,19 +288,10 @@ class LTX2Pipeline(Pipeline):
         logger.info("Loading transformer (FP8, CPU-resident)...")
         self._transformer = load_transformer(transformer_path, device=torch.device("cpu"), dtype=dtype)
 
-        # Step 3b: Merge user LoRA weights (before FFN chunking / streaming setup)
+        # Step 3b: Detect IC-LoRA Union Control (before merge so we can
+        # snapshot original weights for single-pass re-merge if needed).
         if loras is None:
             loras = []
-        if loras:
-            from .lora import load_and_merge_loras
-            self.loaded_lora_adapters = load_and_merge_loras(self._transformer, loras)
-        else:
-            self.loaded_lora_adapters = []
-
-        # Step 3c: Detect IC-LoRA Union Control for deferred merge.
-        # IC-LoRA is NOT merged at init because its weight modifications
-        # interfere with user LoRAs (e.g. style LoRAs) in text-only mode.
-        # It will be merged on first use when video guide input is received.
         IC_LORA_FILENAME = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
         ic_lora_path = get_model_file_path(
             f"LTX-2.3-22b-IC-LoRA-Union-Control/{IC_LORA_FILENAME}"
@@ -313,6 +304,28 @@ class LTX2Pipeline(Pipeline):
             logger.info(f"IC-LoRA Union Control available (deferred): {ic_lora_path}")
         else:
             self._pending_ic_lora = None
+
+        # Step 3c: Build module map before FFN chunking (so LoRA keys
+        # match the original module paths) and merge user LoRA weights.
+        # When IC-LoRA is also available, snapshot original weights so
+        # we can restore + batch re-merge all LoRAs in a single float32
+        # pass later, avoiding FP8 quantization compounding.
+        self._user_lora_configs = list(loras)
+        self._linear_module_map = {
+            name: mod for name, mod in self._transformer.named_modules()
+            if isinstance(mod, torch.nn.Linear)
+        }
+        snapshot = {} if (loras and self._pending_ic_lora is not None) else None
+        if loras:
+            from .lora import load_and_merge_loras
+            self.loaded_lora_adapters = load_and_merge_loras(
+                self._transformer, loras,
+                linear_modules=self._linear_module_map,
+                save_snapshot=snapshot,
+            )
+        else:
+            self.loaded_lora_adapters = []
+        self._original_weights = snapshot
 
         if ffn_chunk_size is not None:
             self._apply_ffn_chunking(ffn_chunk_size)
@@ -398,6 +411,9 @@ class LTX2Pipeline(Pipeline):
         self._cached_context = None
         self._cached_prompt_text = None
         self._streaming_state = None
+        self._original_weights = None
+        self._user_lora_configs = None
+        self._linear_module_map = None
 
         gc.collect()
         if torch.cuda.is_available():
@@ -419,24 +435,37 @@ class LTX2Pipeline(Pipeline):
     # ------------------------------------------------------------------
 
     def _merge_ic_lora(self):
-        """Merge the deferred IC-LoRA Union Control into the transformer.
+        """Merge IC-LoRA Union Control into the transformer.
 
-        Called on first use of video guide conditioning. Requires the
-        transformer to be CPU-resident (before streaming setup) and
-        tears down any existing denoising state first.
+        If user LoRAs were previously merged, restores original weights
+        and re-merges all LoRAs (user + IC) in a single float32 pass
+        to avoid FP8 quantization compounding that washes out effects.
         """
         if self._pending_ic_lora is None:
             return
 
-        from .lora import load_and_merge_loras
+        from .lora import load_and_merge_loras, restore_original_weights
 
         self._teardown_denoising()
 
         ic_cfg = self._pending_ic_lora
         self._pending_ic_lora = None
-        logger.info(f"Merging deferred IC-LoRA: {Path(ic_cfg['path']).name}")
-        merged = load_and_merge_loras(self._transformer, [ic_cfg])
-        self.loaded_lora_adapters.extend(merged)
+        all_configs = self._user_lora_configs + [ic_cfg]
+
+        if self._original_weights:
+            logger.info("Restoring original weights for single-pass LoRA re-merge")
+            restore_original_weights(self._original_weights)
+            self._original_weights = None
+
+        logger.info(
+            "Merging %d LoRA(s) in single pass: %s",
+            len(all_configs),
+            ", ".join(Path(c["path"]).name for c in all_configs),
+        )
+        self.loaded_lora_adapters = load_and_merge_loras(
+            self._transformer, all_configs,
+            linear_modules=self._linear_module_map,
+        )
 
     def _apply_ffn_chunking(self, chunk_size: int):
         for block in self._transformer.transformer_blocks:

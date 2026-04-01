@@ -4,9 +4,14 @@ Permanently merges LoRA deltas into model parameters at load time.
 FP8 quantized layers are dequantized, merged, and re-quantized in place
 so the patched ``_fp8_scaled_forward`` remains correct.  Compatible with
 block streaming and incurs zero runtime overhead.
+
+When multiple LoRAs are combined (e.g. style + IC-LoRA), all deltas are
+accumulated per layer in float32 before a single FP8 requantization,
+avoiding precision loss from intermediate quantization steps.
 """
 
 import logging
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -65,30 +70,60 @@ def _extract_safetensors_metadata(path: str) -> dict[str, str]:
         return dict(f.metadata()) if f.metadata() else {}
 
 
+def restore_original_weights(snapshot: dict[str, dict[str, Any]]) -> None:
+    """Restore original weights from a snapshot created during LoRA merge.
+
+    Uses stored module references directly, so this works even after
+    FFN chunking changes the module hierarchy paths.
+    """
+    for name, entry in snapshot.items():
+        module = entry["module"]
+        module.weight.data.copy_(entry["weight"])
+        if "fp8_weight_scale" in entry:
+            module._fp8_weight_scale = entry["fp8_weight_scale"].clone()
+    logger.info("Restored original weights for %d layers", len(snapshot))
+
+
 def load_and_merge_loras(
     model: nn.Module,
     lora_configs: list[dict[str, Any]],
+    linear_modules: dict[str, nn.Linear] | None = None,
+    save_snapshot: dict | None = None,
 ) -> list[dict[str, Any]]:
     """Load LoRA files and permanently merge weights into *model*.
 
-    For FP8 layers the weight is dequantized via the module's stored
-    ``_fp8_weight_scale``, the delta is added, and the result is
-    re-quantized.  The per-tensor scale is updated on the module so the
-    existing monkey-patched forward (``_fp8_scaled_forward``) stays correct.
+    All LoRA deltas targeting the same layer are accumulated in float32
+    before a single FP8 requantization, avoiding precision loss from
+    intermediate quantization steps when combining multiple LoRAs.
+
+    Args:
+        model: The transformer model to merge into.
+        lora_configs: List of LoRA config dicts with ``path`` and ``scale``.
+        linear_modules: Pre-built name-to-module mapping.  When provided,
+            LoRA keys are matched against these names instead of the
+            current ``model.named_modules()`` hierarchy (useful when FFN
+            chunking has altered the module paths after init).
+        save_snapshot: If provided (empty dict), original weights for
+            each modified layer are saved *before* applying deltas,
+            enabling later restoration via ``restore_original_weights``
+            for a clean single-pass re-merge.
 
     Returns a list of dicts with ``path``, ``scale``, and
-    ``reference_downscale_factor`` (extracted from safetensors metadata
-    for IC-LoRA checkpoints; defaults to ``1.0``).
+    ``reference_downscale_factor`` per merged LoRA.
     """
     if not lora_configs:
         return []
 
-    linear_modules = {
-        name: mod
-        for name, mod in model.named_modules()
-        if isinstance(mod, nn.Linear)
-    }
+    if linear_modules is None:
+        linear_modules = {
+            name: mod
+            for name, mod in model.named_modules()
+            if isinstance(mod, nn.Linear)
+        }
     loaded: list[dict[str, Any]] = []
+
+    # Phase 1: collect all deltas per layer across all LoRA files
+    layer_deltas: dict[str, list[torch.Tensor]] = defaultdict(list)
 
     for cfg in lora_configs:
         path = cfg.get("path")
@@ -116,33 +151,57 @@ def load_and_merge_loras(
         pairs = _extract_lora_pairs(sd)
         del sd
 
-        merged = 0
+        matched = 0
         for model_key, info in pairs.items():
-            module = linear_modules.get(model_key)
-            if module is None:
+            if model_key not in linear_modules:
                 continue
 
             lora_A, lora_B = info["lora_A"].float(), info["lora_B"].float()
             alpha_factor = (info["alpha"] / info["rank"]) if info["alpha"] is not None else 1.0
             delta = (lora_B @ lora_A) * (alpha_factor * scale)
+            layer_deltas[model_key].append(delta)
+            matched += 1
 
-            if module.weight.dtype == torch.float8_e4m3fn:
-                ws = getattr(module, "_fp8_weight_scale", torch.tensor(1.0))
-                w = module.weight.data.float() * ws.float() + delta
-                amax = w.abs().amax().clamp(min=1e-12)
-                new_ws = amax / _FP8_MAX
-                module.weight.data = (w / new_ws).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
-                module._fp8_weight_scale = new_ws
-            else:
-                module.weight.data = (module.weight.data.float() + delta).to(module.weight.dtype)
-
-            merged += 1
-
-        logger.info("Merged %d/%d LoRA weights from %s", merged, len(pairs), Path(path).name)
+        logger.info("Collected %d/%d LoRA deltas from %s", matched, len(pairs), Path(path).name)
         loaded.append({
             "path": str(path),
             "scale": scale,
             "reference_downscale_factor": reference_downscale_factor,
         })
 
+    # Phase 2: apply accumulated deltas with single requantization per layer
+    merged = 0
+    for model_key, deltas in layer_deltas.items():
+        module = linear_modules[model_key]
+
+        if save_snapshot is not None and model_key not in save_snapshot:
+            entry: dict[str, Any] = {
+                "module": module,
+                "weight": module.weight.data.clone(),
+            }
+            if hasattr(module, "_fp8_weight_scale"):
+                entry["fp8_weight_scale"] = module._fp8_weight_scale.clone()
+            save_snapshot[model_key] = entry
+
+        if module.weight.dtype == torch.float8_e4m3fn:
+            ws = getattr(module, "_fp8_weight_scale", torch.tensor(1.0))
+            w = module.weight.data.float() * ws.float()
+            for delta in deltas:
+                w += delta
+            amax = w.abs().amax().clamp(min=1e-12)
+            new_ws = amax / _FP8_MAX
+            module.weight.data = (w / new_ws).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+            module._fp8_weight_scale = new_ws
+        else:
+            w = module.weight.data.float()
+            for delta in deltas:
+                w += delta
+            module.weight.data = w.to(module.weight.dtype)
+
+        merged += 1
+
+    logger.info(
+        "Batch-merged %d layers from %d LoRA file(s)",
+        merged, len(lora_configs),
+    )
     return loaded

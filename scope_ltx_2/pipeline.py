@@ -314,6 +314,22 @@ class LTX2Pipeline(Pipeline):
         else:
             self._pending_ic_lora = None
 
+        # Step 3d: Detect ID-LoRA for deferred merge.
+        # ID-LoRA is merged on first use of audio_mode="id_lora".
+        ID_LORA_FILENAME = "lora_weights.safetensors"
+        id_lora_path = get_model_file_path(
+            f"LTX-2.3-ID-LoRA-CelebVHQ-3K/{ID_LORA_FILENAME}"
+        )
+        already_has_id_lora = any(
+            "ID-LoRA" in (cfg.get("path") or "") for cfg in loras
+        )
+        if id_lora_path.exists() and not already_has_id_lora:
+            self._pending_id_lora = {"path": str(id_lora_path), "scale": 1.0}
+            logger.info(f"ID-LoRA available (deferred): {id_lora_path}")
+        else:
+            self._pending_id_lora = None
+        self._id_lora_merged = False
+
         if ffn_chunk_size is not None:
             self._apply_ffn_chunking(ffn_chunk_size)
 
@@ -432,19 +448,62 @@ class LTX2Pipeline(Pipeline):
 
         self._teardown_denoising()
 
+        # Undo FFN chunking so module paths match LoRA keys, then re-apply
+        self._undo_ffn_chunking()
         ic_cfg = self._pending_ic_lora
         self._pending_ic_lora = None
         logger.info(f"Merging deferred IC-LoRA: {Path(ic_cfg['path']).name}")
         merged = load_and_merge_loras(self._transformer, [ic_cfg])
         self.loaded_lora_adapters.extend(merged)
+        if self.ffn_chunk_size is not None:
+            self._apply_ffn_chunking(self.ffn_chunk_size)
+
+    def _merge_id_lora(self):
+        """Merge the deferred ID-LoRA into the transformer.
+
+        Called on first use of audio_mode="id_lora". Permanently merges
+        the ID-LoRA weights so reference audio conditioning works correctly.
+        """
+        if self._id_lora_merged:
+            return
+        if self._pending_id_lora is None:
+            logger.warning(
+                "ID-LoRA mode requested but no ID-LoRA weights found. "
+                "Download from https://huggingface.co/AviadDahan/LTX-2.3-ID-LoRA-CelebVHQ-3K "
+                "and place lora_weights.safetensors in models/LTX-2.3-ID-LoRA-CelebVHQ-3K/"
+            )
+            return
+
+        from .lora import load_and_merge_loras
+
+        self._teardown_denoising()
+
+        # Undo FFN chunking so module paths match LoRA keys, then re-apply
+        self._undo_ffn_chunking()
+        id_cfg = self._pending_id_lora
+        self._pending_id_lora = None
+        logger.info(f"Merging ID-LoRA: {Path(id_cfg['path']).name}")
+        merged = load_and_merge_loras(self._transformer, [id_cfg])
+        self.loaded_lora_adapters.extend(merged)
+        if self.ffn_chunk_size is not None:
+            self._apply_ffn_chunking(self.ffn_chunk_size)
+        self._id_lora_merged = True
 
     def _apply_ffn_chunking(self, chunk_size: int):
         for block in self._transformer.transformer_blocks:
-            if hasattr(block, 'ff'):
+            if hasattr(block, 'ff') and not isinstance(block.ff, _ChunkedFFN):
                 block.ff = _ChunkedFFN(block.ff, chunk_size)
-            if hasattr(block, 'audio_ff'):
+            if hasattr(block, 'audio_ff') and not isinstance(block.audio_ff, _ChunkedFFN):
                 block.audio_ff = _ChunkedFFN(block.audio_ff, chunk_size)
         logger.info(f"FFN chunking applied with chunk_size={chunk_size}")
+
+    def _undo_ffn_chunking(self):
+        """Unwrap ``_ChunkedFFN`` so module paths match LoRA keys."""
+        for block in self._transformer.transformer_blocks:
+            if hasattr(block, 'ff') and isinstance(block.ff, _ChunkedFFN):
+                block.ff = block.ff.ff
+            if hasattr(block, 'audio_ff') and isinstance(block.audio_ff, _ChunkedFFN):
+                block.audio_ff = block.audio_ff.ff
 
     def _offload_text_encoder(self):
         if not self._text_encoder_on_gpu:
@@ -557,6 +616,99 @@ class LTX2Pipeline(Pipeline):
         logger.info(f"Vocoder loaded: {sum(p.numel() for p in vocoder.parameters())/1e6:.1f}M params")
 
         return audio_vae, vocoder
+
+    # ------------------------------------------------------------------
+    # Audio encoding (for driving audio / ID-LoRA reference)
+    # ------------------------------------------------------------------
+
+    def _encode_audio(
+        self,
+        audio_path: str,
+        max_duration_s: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Encode an audio file to normalised audio VAE latents.
+
+        Args:
+            audio_path: Path to the input audio file.
+            max_duration_s: If set, truncate to this many seconds after
+                resampling. Useful for ID-LoRA reference clips (trained
+                on ~5 s excerpts).
+
+        Returns:
+            ``(latents, waveform, sample_rate)`` where *latents* has shape
+            ``(1, 8, T, 16)`` (normalised VAE latents) and *waveform* is
+            the original audio tensor ``(channels, samples)`` at the
+            returned *sample_rate*.
+        """
+        import soundfile as sf
+        import torchaudio
+
+        data, sr = sf.read(str(audio_path), dtype="float32", always_2d=True)
+        waveform = torch.from_numpy(data.T)  # (channels, samples)
+
+        vae_sr = self._audio_vae.sampling_rate
+        if sr != vae_sr:
+            waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
+            sr = vae_sr
+
+        if max_duration_s is not None:
+            max_samples = int(max_duration_s * sr)
+            if waveform.shape[1] > max_samples:
+                original_dur = waveform.shape[1] / sr
+                waveform = waveform[:, :max_samples]
+                logger.info(
+                    f"Reference audio truncated: {original_dur:.1f}s -> "
+                    f"{max_duration_s:.1f}s ({max_samples} samples)"
+                )
+
+        if waveform.shape[0] == 1:
+            waveform = waveform.repeat(2, 1)
+        elif waveform.shape[0] > 2:
+            waveform = waveform[:2]
+
+        n_fft = self._audio_vae.n_fft
+        hop_length = self._audio_vae.mel_hop_length
+        n_mels = self._audio_vae.mel_bins
+
+        mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=vae_sr,
+            n_fft=n_fft,
+            win_length=n_fft,
+            hop_length=hop_length,
+            f_min=0.0,
+            f_max=vae_sr / 2.0,
+            n_mels=n_mels,
+            window_fn=torch.hann_window,
+            center=True,
+            pad_mode="reflect",
+            power=1.0,
+            mel_scale="slaney",
+            norm="slaney",
+        ).to(device=self.device)
+
+        wav_gpu = waveform.to(device=self.device, dtype=torch.float32)
+        mel = mel_transform(wav_gpu)
+        mel = torch.log(torch.clamp(mel, min=1e-5))
+        mel = mel.unsqueeze(0)
+        mel = mel.permute(0, 1, 3, 2)
+
+        with torch.no_grad():
+            raw = self._audio_vae.encode(mel)
+
+        latents = raw[:, :8]
+
+        from einops import rearrange
+        patched = rearrange(latents, "b c t f -> b t (c f)")
+        normalised = self._audio_vae.per_channel_statistics.normalize(patched)
+        latents = rearrange(normalised, "b t (c f) -> b c t f", c=8, f=16)
+
+        logger.info(
+            f"Audio encode: {audio_path} -> mel {mel.shape} -> "
+            f"latents {latents.shape} (duration={waveform.shape[1]/sr:.2f}s) "
+            f"mean={latents.mean().item():.4f} std={latents.std().item():.4f} "
+            f"range=[{latents.min().item():.2f},{latents.max().item():.2f}]"
+        )
+        return latents.to(dtype=self.dtype), waveform, sr
 
     # ------------------------------------------------------------------
     # Inference
@@ -795,8 +947,52 @@ class LTX2Pipeline(Pipeline):
                 "Falling back to text-only generation."
             )
 
+        # =================================================================
+        # Audio input (driving audio / ID-LoRA reference)
+        # =================================================================
+        audio_input_path = kwargs.get("audio_input")
+        audio_mode = kwargs.get("audio_mode", "driving")
+        id_guidance_scale = float(kwargs.get("identity_guidance_scale", 3.0))
+        driving_audio_latents = None
+        driving_waveform = None
+        driving_sr = None
+        ref_audio = None
+
+        import math
         video_duration_sec = num_frames / frame_rate
-        audio_latent_time = round(video_duration_sec * 25)
+        audio_latent_time = math.ceil(video_duration_sec * 25)
+
+        if audio_input_path and audio_mode == "driving":
+            logger.info(f"Driving audio mode: encoding {audio_input_path}")
+            enc_latents, driving_waveform, driving_sr = self._encode_audio(audio_input_path)
+
+            t_enc = enc_latents.shape[2]
+            if t_enc < audio_latent_time:
+                pad = torch.zeros(
+                    1, 8, audio_latent_time - t_enc, 16,
+                    device=enc_latents.device, dtype=enc_latents.dtype,
+                )
+                driving_audio_latents = torch.cat([enc_latents, pad], dim=2)
+            elif t_enc > audio_latent_time:
+                driving_audio_latents = enc_latents[:, :, :audio_latent_time]
+            else:
+                driving_audio_latents = enc_latents
+            logger.info(
+                f"Driving audio latents: {driving_audio_latents.shape} "
+                f"(encoded {t_enc} -> target {audio_latent_time})"
+            )
+
+        elif audio_input_path and audio_mode == "id_lora":
+            self._merge_id_lora()
+            logger.info(f"ID-LoRA mode: encoding reference audio {audio_input_path}")
+            ref_audio, _, _ = self._encode_audio(
+                audio_input_path, max_duration_s=10.0,
+            )
+            logger.info(
+                f"ID-LoRA reference audio latents: {ref_audio.shape} "
+                f"(identity_guidance_scale={id_guidance_scale})"
+            )
+
         audio_latents = torch.randn(
             (1, 8, audio_latent_time, 16),
             generator=generator, device=self.device, dtype=self.dtype,
@@ -816,6 +1012,9 @@ class LTX2Pipeline(Pipeline):
             denoise_mask=denoise_mask,
             clean_latent=clean_latent,
             keyframe_idxs=keyframe_idxs,
+            driving_audio_latents=driving_audio_latents,
+            ref_audio=ref_audio,
+            identity_guidance_scale=id_guidance_scale if ref_audio is not None else 0.0,
         )
 
         # Strip appended guide frames before VAE decode
@@ -846,8 +1045,16 @@ class LTX2Pipeline(Pipeline):
         logger.info("Decoding video from latents...")
         video_tensor = self._decode_video(video_latents)
 
-        logger.info("Decoding audio from latents...")
-        audio_tensor, audio_sample_rate = self._decode_audio(audio_latents)
+        if driving_waveform is not None:
+            logger.info("Driving audio mode: skipping audio decode, using original waveform")
+            target_samples = int(video_duration_sec * driving_sr)
+            if driving_waveform.shape[-1] > target_samples:
+                driving_waveform = driving_waveform[..., :target_samples]
+            audio_tensor = driving_waveform.cpu()
+            audio_sample_rate = driving_sr
+        else:
+            logger.info("Decoding audio from latents...")
+            audio_tensor, audio_sample_rate = self._decode_audio(audio_latents)
 
         logger.info(
             f"Generated: video={video_tensor.shape}, audio={audio_tensor.shape}, "
@@ -999,6 +1206,9 @@ class LTX2Pipeline(Pipeline):
         denoise_mask: torch.Tensor | None = None,
         clean_latent: torch.Tensor | None = None,
         keyframe_idxs: torch.Tensor | None = None,
+        driving_audio_latents: torch.Tensor | None = None,
+        ref_audio: torch.Tensor | None = None,
+        identity_guidance_scale: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Euler sampling with weight-streamed transformer blocks.
 
@@ -1020,9 +1230,23 @@ class LTX2Pipeline(Pipeline):
         transformer's ``_process_input`` uses negative ``denoise_mask`` values
         to filter padding tokens from dilated guide latents and injects the
         custom RoPE coordinates for the guide tokens.
+
+        **Driving audio** — when ``driving_audio_latents`` is provided, the
+        audio channel is clamped to the pre-encoded input audio with
+        ``timestep=0`` at every step.  The model still cross-attends to the
+        audio, driving the video generation, but audio itself is not diffused.
+
+        **ID-LoRA** — when ``ref_audio`` is provided, reference tokens are
+        injected via the transformer's ``_process_input``.  If
+        ``identity_guidance_scale > 0``, an extra forward pass **without**
+        reference audio is performed and the audio prediction is boosted:
+        ``a_pred += (a_pred - a_pred_noref) * identity_guidance_scale``.
         """
+        driving = driving_audio_latents is not None
+        use_id_guidance = ref_audio is not None and identity_guidance_scale > 0.0
+
         v_noisy = video_latents * sigmas[0]
-        a_noisy = audio_latents * sigmas[0]
+        a_noisy = driving_audio_latents if driving else audio_latents * sigmas[0]
 
         for i in range(len(sigmas) - 1):
             if self._cancelled:
@@ -1047,7 +1271,10 @@ class LTX2Pipeline(Pipeline):
             else:
                 v_timestep = sigma.expand(v_noisy.shape[0])
 
-            a_timestep = sigma.expand(a_noisy.shape[0])
+            if driving:
+                a_timestep = torch.zeros(a_noisy.shape[0], device=a_noisy.device)
+            else:
+                a_timestep = sigma.expand(a_noisy.shape[0])
 
             with torch.autocast(device_type=self.device.type, dtype=self.dtype):
                 model_output = self._transformer(
@@ -1058,6 +1285,7 @@ class LTX2Pipeline(Pipeline):
                     frame_rate=frame_rate,
                     keyframe_idxs=keyframe_idxs,
                     denoise_mask=denoise_mask,
+                    ref_audio=ref_audio,
                 )
 
             if isinstance(model_output, list):
@@ -1067,9 +1295,29 @@ class LTX2Pipeline(Pipeline):
                 v_pred = model_output
                 a_pred = a_noisy
 
+            # -- ID-LoRA identity guidance: extra pass without reference --
+            if use_id_guidance:
+                with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                    noref_output = self._transformer(
+                        x=[v_noisy, a_noisy],
+                        timestep=[v_timestep, a_timestep],
+                        context=context,
+                        attention_mask=None,
+                        frame_rate=frame_rate,
+                        keyframe_idxs=keyframe_idxs,
+                        denoise_mask=denoise_mask,
+                        ref_audio=None,
+                    )
+                if isinstance(noref_output, list) and len(noref_output) > 1:
+                    a_pred_noref = noref_output[1]
+                    a_pred = a_pred + (a_pred - a_pred_noref) * identity_guidance_scale
+
             dt = sigma_next - sigma
             v_noisy = v_noisy + v_pred * dt
-            a_noisy = a_noisy + a_pred * dt
+            if not driving:
+                a_noisy = a_noisy + a_pred * dt
+            else:
+                a_noisy = driving_audio_latents
 
             # -- i2v post-step masking: re-anchor conditioned frames
             if denoise_mask is not None and clean_latent is not None:

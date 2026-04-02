@@ -117,9 +117,11 @@ def load_and_merge_loras(
         del sd
 
         merged = 0
+        unmapped = []
         for model_key, info in pairs.items():
             module = linear_modules.get(model_key)
             if module is None:
+                unmapped.append(model_key)
                 continue
 
             lora_A, lora_B = info["lora_A"].float(), info["lora_B"].float()
@@ -139,6 +141,12 @@ def load_and_merge_loras(
             merged += 1
 
         logger.info("Merged %d/%d LoRA weights from %s", merged, len(pairs), Path(path).name)
+        if unmapped:
+            logger.warning(
+                "Unmapped LoRA keys (%d): %s",
+                len(unmapped),
+                ", ".join(unmapped[:8]) + ("..." if len(unmapped) > 8 else ""),
+            )
         loaded.append({
             "path": str(path),
             "scale": scale,

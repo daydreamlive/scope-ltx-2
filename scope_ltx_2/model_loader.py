@@ -138,6 +138,14 @@ def detect_config_from_state_dict(state_dict: dict, metadata: dict | None = None
     if metadata is not None and "config" in metadata:
         try:
             extra = json.loads(metadata["config"]).get("transformer", {})
+            for k, v in extra.items():
+                if isinstance(v, float) and v.is_integer():
+                    extra[k] = int(v)
+                elif isinstance(v, list):
+                    extra[k] = [
+                        int(x) if isinstance(x, float) and x.is_integer() else x
+                        for x in v
+                    ]
             config.update(extra)
         except (json.JSONDecodeError, AttributeError):
             pass

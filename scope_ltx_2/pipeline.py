@@ -624,6 +624,18 @@ class LTX2Pipeline(Pipeline):
 
     @torch.inference_mode()
     def _generate(self, **kwargs) -> dict:
+        # Guard: if unload() has already been called (e.g. a concurrent pipeline
+        # reload deleted model attributes while this generation was still in-flight),
+        # raise a clear RuntimeError instead of a confusing AttributeError deep in
+        # the text-encoding path.
+        if not hasattr(self, '_text_projection'):
+            raise RuntimeError(
+                "LTX2Pipeline._text_projection is missing — the pipeline was "
+                "unloaded while a generation was in-flight. "
+                "This is likely caused by a concurrent pipeline reload. "
+                "The processor should reinitialize the pipeline."
+            )
+
         from .text_encoder import encode_prompt
 
         from .schema import VAE_SPATIAL_FACTOR, make_sigma_schedule, snap_frame_count, snap_to_multiple

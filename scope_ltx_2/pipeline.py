@@ -25,6 +25,7 @@ import json
 import logging
 import random
 import time
+from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -40,6 +41,12 @@ if TYPE_CHECKING:
 
 logging.getLogger("scope_ltx_2").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Standard WebRTC video clock (90 kHz).  We emit per-frame PTS against this
+# time base so downstream pacing aligns with wall-clock playback, independent
+# of the configured frame rate.
+_VIDEO_CLOCK_RATE = 90000
+_VIDEO_TIME_BASE = Fraction(1, _VIDEO_CLOCK_RATE)
 
 def _load_sd_with_prefix_replace(
     checkpoint_path: str,
@@ -332,6 +339,12 @@ class LTX2Pipeline(Pipeline):
         self._streaming_state = None
         self._vaes_on_gpu = False
 
+        # Running media-time cursor (in 90 kHz ticks) shared by video and
+        # audio timestamps.  Each chunk advances it by the chunk's duration
+        # so downstream WebRTC pacing keeps bursty output chunks monotonic
+        # and A/V locked.
+        self._media_ticks = 0
+
         logger.info(f"LTX 2.3 pipeline loaded in {time.time() - start:.1f}s")
         _log_gpu_memory("all loaded")
 
@@ -564,6 +577,44 @@ class LTX2Pipeline(Pipeline):
 
     def __call__(self, **kwargs) -> dict:
         return self._generate(**kwargs)
+
+    def _advance_chunk_timestamps(
+        self,
+        num_frames: int,
+        audio_samples: int,
+        audio_sample_rate: int,
+    ) -> tuple[list[dict], list[dict]]:
+        """Derive per-chunk video + audio timestamps from the model output.
+
+        Everything comes from the tensors LTX-2 actually returned:
+        ``video_tensor.shape[0]`` fixes the number of video frames,
+        ``audio_tensor.shape[-1]`` and ``audio_sample_rate`` fix the chunk's
+        duration.  Per-frame video spacing is then just ``duration / N``, so we
+        never rely on the caller-supplied ``frame_rate`` parameter that LTX-2
+        only consumes as a hint during denoising.
+
+        We anchor the chunk to a single media-time cursor (in 90 kHz ticks)
+        shared by both streams, so the downstream WebRTC pacing layer sees
+        monotonic timestamps across generation calls and keeps A/V locked.
+        """
+        if audio_samples <= 0 or audio_sample_rate <= 0 or num_frames <= 0:
+            return [], []
+
+        base_ticks = self._media_ticks
+        chunk_duration_ticks = audio_samples * _VIDEO_CLOCK_RATE / audio_sample_rate
+        ticks_per_frame = chunk_duration_ticks / num_frames
+
+        video_ts = [
+            {
+                "pts": base_ticks + int(round(i * ticks_per_frame)),
+                "time_base": _VIDEO_TIME_BASE,
+            }
+            for i in range(num_frames)
+        ]
+        audio_ts = [{"pts": base_ticks, "time_base": _VIDEO_TIME_BASE}]
+
+        self._media_ticks = base_ticks + int(round(chunk_duration_ticks))
+        return video_ts, audio_ts
 
     def _ensure_denoising_ready(self, total_tokens: int = 0):
         """Ensure scaffold and block streaming are set up on GPU.
@@ -828,10 +879,20 @@ class LTX2Pipeline(Pipeline):
 
         if self._cancelled:
             logger.info("Generation cancelled, skipping VAE decode")
+            cancelled_video = torch.zeros(1, height, width, 3)
+            cancelled_audio = torch.zeros(2, 1)
+            cancelled_sample_rate = 48000
+            video_timestamps, audio_timestamps = self._advance_chunk_timestamps(
+                num_frames=cancelled_video.shape[0],
+                audio_samples=cancelled_audio.shape[-1],
+                audio_sample_rate=cancelled_sample_rate,
+            )
             return {
-                "video": torch.zeros(1, height, width, 3),
-                "audio": torch.zeros(2, 1),
-                "audio_sample_rate": 48000,
+                "video": cancelled_video,
+                "video_timestamps": video_timestamps,
+                "audio": cancelled_audio,
+                "audio_sample_rate": cancelled_sample_rate,
+                "audio_timestamps": audio_timestamps,
                 "frame_rate": frame_rate,
             }
 
@@ -849,15 +910,40 @@ class LTX2Pipeline(Pipeline):
         logger.info("Decoding audio from latents...")
         audio_tensor, audio_sample_rate = self._decode_audio(audio_latents)
 
+        # Align audio length to video duration so downstream A/V sync is exact.
+        # The audio VAE produces slightly fewer samples than `num_frames / frame_rate`
+        # because of latent rounding (audio_latent_time = round(duration * 25)).
+        # Pad with silence or truncate so every chunk is exactly the video
+        # duration — this keeps cumulative drift at zero across chunks.
+        target_samples = int(round(num_frames * audio_sample_rate / frame_rate))
+        current_samples = audio_tensor.shape[-1]
+        if current_samples < target_samples:
+            pad = torch.zeros(
+                (*audio_tensor.shape[:-1], target_samples - current_samples),
+                dtype=audio_tensor.dtype,
+                device=audio_tensor.device,
+            )
+            audio_tensor = torch.cat([audio_tensor, pad], dim=-1)
+        elif current_samples > target_samples:
+            audio_tensor = audio_tensor[..., :target_samples]
+
         logger.info(
             f"Generated: video={video_tensor.shape}, audio={audio_tensor.shape}, "
             f"duration={audio_tensor.shape[-1] / audio_sample_rate:.2f}s @ {audio_sample_rate}Hz"
         )
 
+        video_timestamps, audio_timestamps = self._advance_chunk_timestamps(
+            num_frames=video_tensor.shape[0],
+            audio_samples=audio_tensor.shape[-1],
+            audio_sample_rate=audio_sample_rate,
+        )
+
         return {
             "video": video_tensor,
+            "video_timestamps": video_timestamps,
             "audio": audio_tensor,
             "audio_sample_rate": audio_sample_rate,
+            "audio_timestamps": audio_timestamps,
             "frame_rate": frame_rate,
         }
 

@@ -179,6 +179,12 @@ class LTX2Config(BasePipelineConfig):
                 "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
             ],
         ),
+        HuggingfaceRepoArtifact(
+            repo_id="AviadDahan/LTX-2.3-ID-LoRA-CelebVHQ-3K",
+            files=[
+                "lora_weights.safetensors",
+            ],
+        ),
     ]
 
     produces_audio: ClassVar[bool] = True
@@ -349,5 +355,48 @@ class LTX2Config(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=12, label="Control Strength", is_load_param=False,
             category="input", modes=["video"],
+        ),
+    )
+
+    # Audio input
+    audio_input: str | None = Field(
+        default=None,
+        description=(
+            "Input audio file. In 'driving' mode the video syncs to this audio "
+            "(output audio = input audio). In 'id_lora' mode it serves as a "
+            "speaker identity reference (~5 s recommended; requires ID-LoRA weights)."
+        ),
+        json_schema_extra=ui_field_config(
+            order=13, component="audio", label="Audio Input",
+            is_load_param=False, category="input",
+        ),
+    )
+
+    audio_mode: Literal["driving", "id_lora"] = Field(
+        default="driving",
+        description=(
+            "'driving': Audio drives video generation — output audio equals "
+            "the input and no audio diffusion is performed. "
+            "'id_lora': Audio is a speaker identity reference; generated audio "
+            "matches the voice (requires ID-LoRA LoRA weights)."
+        ),
+        json_schema_extra=ui_field_config(
+            order=14, label="Audio Mode", is_load_param=False,
+            category="input",
+        ),
+    )
+
+    identity_guidance_scale: float = Field(
+        default=3.0,
+        ge=0.0,
+        le=20.0,
+        description=(
+            "ID-LoRA identity guidance strength. Runs an extra forward pass "
+            "without reference to amplify speaker identity. 0 = disabled. "
+            "Only active in id_lora mode."
+        ),
+        json_schema_extra=ui_field_config(
+            order=15, label="Identity Guidance", is_load_param=False,
+            category="input",
         ),
     )

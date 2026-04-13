@@ -1725,6 +1725,40 @@ class LTXAVModel(LTXVModel):
         additional_args["has_spatial_mask"] = has_spatial_mask
 
         ax, a_latent_coords = self.a_patchifier.patchify(ax)
+
+        # -- ID-LoRA: prepend reference audio tokens with negative positions --
+        ref_audio = kwargs.get("ref_audio")
+        ref_audio_seq_len = 0
+        if ref_audio is not None:
+            ref_patchifier = self.a_patchifier.copy_with_shift(0)
+            ref_tokens, _ = ref_patchifier.patchify(ref_audio)
+            ref_audio_seq_len = ref_tokens.shape[1]
+            B = ax.shape[0]
+
+            # Compute negative temporal coordinates (ComfyUI ID-LoRA convention):
+            # use positive indices then offset so reference ends just before t=0.
+            p = self.a_patchifier
+            tpl = p.hop_length * p.audio_latent_downsample_factor / p.sample_rate
+            ref_start = p._get_audio_latent_time_in_sec(
+                0, ref_audio_seq_len, torch.float32, ax.device
+            )
+            ref_end = p._get_audio_latent_time_in_sec(
+                1, ref_audio_seq_len + 1, torch.float32, ax.device
+            )
+            time_offset = ref_end[-1].item() + tpl
+            ref_start = (ref_start - time_offset).unsqueeze(0).expand(B, -1).unsqueeze(1)
+            ref_end = (ref_end - time_offset).unsqueeze(0).expand(B, -1).unsqueeze(1)
+            ref_coords = torch.stack([ref_start, ref_end], dim=-1)
+
+            additional_args["ref_audio_seq_len"] = ref_audio_seq_len
+            additional_args["target_audio_seq_len"] = ax.shape[1]
+            ax = torch.cat([ref_tokens, ax], dim=1)
+            a_latent_coords = torch.cat([ref_coords.to(a_latent_coords), a_latent_coords], dim=2)
+
+        if ref_audio is None:
+            additional_args["ref_audio_seq_len"] = 0
+            additional_args["target_audio_seq_len"] = ax.shape[1]
+
         ax = self.audio_patchify_proj(ax)
 
         return [vx, ax], [v_pixel_coords, a_latent_coords], additional_args
@@ -1757,6 +1791,18 @@ class LTXAVModel(LTXVModel):
         )
 
         a_timestep = kwargs.get("a_timestep")
+        ref_audio_seq_len = kwargs.get("ref_audio_seq_len", 0)
+
+        # Prepend zero timesteps for ID-LoRA reference tokens
+        if a_timestep is not None and ref_audio_seq_len > 0:
+            ref_zeros = torch.zeros(
+                a_timestep.shape[0], ref_audio_seq_len,
+                device=a_timestep.device, dtype=a_timestep.dtype,
+            )
+            if a_timestep.ndim == 1:
+                a_timestep = a_timestep.unsqueeze(1).expand(-1, kwargs.get("target_audio_seq_len", 1))
+            a_timestep = torch.cat([ref_zeros, a_timestep], dim=1)
+
         if a_timestep is not None:
             a_timestep_scaled = a_timestep * self.timestep_scale_multiplier
             a_timestep_flat = a_timestep_scaled.flatten()
@@ -1929,6 +1975,12 @@ class LTXAVModel(LTXVModel):
         ax = x[1]
         v_embedded_timestep = embedded_timestep[0]
         a_embedded_timestep = embedded_timestep[1]
+
+        # Trim ID-LoRA reference tokens before unpatchify
+        ref_n = kwargs.get("ref_audio_seq_len", 0)
+        if ref_n > 0:
+            ax = ax[:, ref_n:]
+            a_embedded_timestep = a_embedded_timestep[:, ref_n:]
 
         if isinstance(v_embedded_timestep, CompressedTimestep):
             v_embedded_timestep = v_embedded_timestep.expand()

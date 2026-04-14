@@ -297,24 +297,7 @@ class LTX2Pipeline(Pipeline):
         else:
             self.loaded_lora_adapters = []
 
-        # Step 3c: Detect IC-LoRA Union Control for deferred merge.
-        # IC-LoRA is NOT merged at init because its weight modifications
-        # interfere with user LoRAs (e.g. style LoRAs) in text-only mode.
-        # It will be merged on first use when video guide input is received.
-        IC_LORA_FILENAME = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
-        ic_lora_path = get_model_file_path(
-            f"LTX-2.3-22b-IC-LoRA-Union-Control/{IC_LORA_FILENAME}"
-        )
-        already_has_ic_lora = any(
-            IC_LORA_FILENAME in (cfg.get("path") or "") for cfg in loras
-        )
-        if ic_lora_path.exists() and not already_has_ic_lora:
-            self._pending_ic_lora = {"path": str(ic_lora_path), "scale": 1.0}
-            logger.info(f"IC-LoRA Union Control available (deferred): {ic_lora_path}")
-        else:
-            self._pending_ic_lora = None
-
-        # Step 3d: Detect ID-LoRA for deferred merge.
+        # Step 3c: Detect ID-LoRA for deferred merge.
         # ID-LoRA is merged on first use of audio_mode="id_lora".
         ID_LORA_FILENAME = "lora_weights.safetensors"
         id_lora_path = get_model_file_path(
@@ -433,30 +416,6 @@ class LTX2Pipeline(Pipeline):
     # ------------------------------------------------------------------
     # Model management helpers
     # ------------------------------------------------------------------
-
-    def _merge_ic_lora(self):
-        """Merge the deferred IC-LoRA Union Control into the transformer.
-
-        Called on first use of video guide conditioning. Requires the
-        transformer to be CPU-resident (before streaming setup) and
-        tears down any existing denoising state first.
-        """
-        if self._pending_ic_lora is None:
-            return
-
-        from .lora import load_and_merge_loras
-
-        self._teardown_denoising()
-
-        # Undo FFN chunking so module paths match LoRA keys, then re-apply
-        self._undo_ffn_chunking()
-        ic_cfg = self._pending_ic_lora
-        self._pending_ic_lora = None
-        logger.info(f"Merging deferred IC-LoRA: {Path(ic_cfg['path']).name}")
-        merged = load_and_merge_loras(self._transformer, [ic_cfg])
-        self.loaded_lora_adapters.extend(merged)
-        if self.ffn_chunk_size is not None:
-            self._apply_ffn_chunking(self.ffn_chunk_size)
 
     def _merge_id_lora(self):
         """Merge the deferred ID-LoRA into the transformer.
@@ -745,7 +704,7 @@ class LTX2Pipeline(Pipeline):
 
         # Forward pass intermediates (Q/K/V projections, FFN activations, etc.)
         # scale linearly with sequence length. Base safety of 1.5 GB is
-        # calibrated for the normal ~2k token case; scale up for IC-LoRA.
+        # calibrated for the normal ~2k token case; scale up for guide conditioning.
         BASE_TOKENS = 2040
         safety_gb = 1.5
         if total_tokens > BASE_TOKENS:
@@ -915,23 +874,15 @@ class LTX2Pipeline(Pipeline):
         video_latents = video_noise
 
         # =================================================================
-        # IC-LoRA guide conditioning (depth / canny / pose via video port)
+        # Guide conditioning (video port)
         # =================================================================
         video_input = kwargs.get("video")
         control_strength = float(kwargs.get("control_strength", 1.0))
         keyframe_idxs = None
         num_guide_latent_frames = 0
 
-        has_ic_lora = any(
-            a.get("reference_downscale_factor", 1.0) > 1.0
-            for a in self.loaded_lora_adapters
-        )
-        ic_lora_available = has_ic_lora or self._pending_ic_lora is not None
-
-        if video_input is not None and ic_lora_available:
-            if not has_ic_lora:
-                self._merge_ic_lora()
-            logger.info(f"IC-LoRA guide conditioning (strength={control_strength})")
+        if video_input is not None:
+            logger.info(f"Guide conditioning (strength={control_strength})")
             control_frames = _video_input_to_frames(video_input, self.device, self.dtype)
             logger.info(f"Control frames: {control_frames.shape[0]} frames {control_frames.shape}")
 
@@ -939,12 +890,6 @@ class LTX2Pipeline(Pipeline):
              keyframe_idxs, num_guide_latent_frames) = self._prepare_ic_lora_guide(
                 control_frames, video_latents, denoise_mask, clean_latent,
                 height, width, control_strength,
-            )
-        elif video_input is not None:
-            logger.warning(
-                "Video input received but no IC-LoRA Union Control loaded — "
-                "skipping guide conditioning (output would be corrupted). "
-                "Falling back to text-only generation."
             )
 
         # =================================================================
@@ -1212,7 +1157,7 @@ class LTX2Pipeline(Pipeline):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Euler sampling with weight-streamed transformer blocks.
 
-        For i2v / IC-LoRA conditioning this replicates ComfyUI's
+        For i2v / guide conditioning this replicates ComfyUI's
         ``KSamplerX0Inpaint`` + ``LTXAV.process_timestep`` behaviour:
 
         1. **Pre-model masking** — conditioned frames are replaced with the
@@ -1226,7 +1171,7 @@ class LTX2Pipeline(Pipeline):
            are anchored back to ``clean_latent`` (equivalent to ComfyUI's
            post-model output masking which forces ``d=0`` for those frames).
 
-        When ``keyframe_idxs`` is provided (IC-LoRA guide conditioning), the
+        When ``keyframe_idxs`` is provided (guide conditioning), the
         transformer's ``_process_input`` uses negative ``denoise_mask`` values
         to filter padding tokens from dilated guide latents and injects the
         custom RoPE coordinates for the guide tokens.
@@ -1335,7 +1280,7 @@ class LTX2Pipeline(Pipeline):
         return v_noisy, a_noisy
 
     # ------------------------------------------------------------------
-    # VAE encode (for i2v / IC-LoRA guide conditioning)
+    # VAE encode (for i2v / guide conditioning)
     # ------------------------------------------------------------------
 
     def _encode_image(
@@ -1395,7 +1340,7 @@ class LTX2Pipeline(Pipeline):
         return latent
 
     # ------------------------------------------------------------------
-    # IC-LoRA guide conditioning
+    # Guide conditioning
     # ------------------------------------------------------------------
 
     def _prepare_ic_lora_guide(
@@ -1408,13 +1353,14 @@ class LTX2Pipeline(Pipeline):
         width: int,
         strength: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Prepare IC-LoRA guide conditioning for depth/control-driven generation.
+        """Prepare guide conditioning for video-to-video generation.
 
         Replicates ComfyUI's ``LTXAddVideoICLoRAGuide`` workflow:
 
-        1. Encode control frames at reduced resolution (target / downscale_factor)
-        2. Dilate the small latent into a full-resolution grid with validity mask
-        3. Append dilated guide to video latents along temporal dimension
+        1. Encode control frames (optionally at reduced resolution via
+           ``reference_downscale_factor`` from LoRA metadata)
+        2. Dilate the small latent into a full-resolution grid if downscaled
+        3. Append guide to video latents along temporal dimension
         4. Build ``keyframe_idxs`` with adjusted RoPE coordinates
         5. Combine masks for the Euler denoising loop
 
@@ -1436,7 +1382,7 @@ class LTX2Pipeline(Pipeline):
         downscale_factor = 1.0
         for adapter in self.loaded_lora_adapters:
             dsf = adapter.get("reference_downscale_factor", 1.0)
-            if dsf > 1.0:
+            if dsf != 1.0:
                 downscale_factor = dsf
                 break
 
@@ -1463,7 +1409,7 @@ class LTX2Pipeline(Pipeline):
             control_frames = control_frames[1:]
 
         logger.info(
-            f"IC-LoRA guide: {n_raw} frames -> {n_keep} kept, "
+            f"Guide conditioning: {n_raw} frames -> {n_keep} kept, "
             f"encoded at {target_height}x{target_width} -> latent {guide_latent.shape}, "
             f"downscale_factor={downscale_factor}"
         )
@@ -1480,7 +1426,7 @@ class LTX2Pipeline(Pipeline):
                 )
             guide_latent, guide_mask = _dilate_latent(guide_latent, int_dsf, int_dsf)
             logger.info(
-                f"IC-LoRA dilated guide: {guide_orig_shape} -> {list(guide_latent.shape[2:])}"
+                f"Dilated guide: {guide_orig_shape} -> {list(guide_latent.shape[2:])}"
             )
 
         num_guide_frames = guide_latent.shape[2]
@@ -1559,7 +1505,7 @@ class LTX2Pipeline(Pipeline):
             denoise_mask = denoise_mask.expand(-1, -1, -1, lat_h, lat_w).contiguous()
 
         logger.info(
-            f"IC-LoRA guide appended: video_latents {video_latents.shape}, "
+            f"Guide appended: video_latents {video_latents.shape}, "
             f"denoise_mask {denoise_mask.shape}, "
             f"keyframe_idxs {keyframe_idxs.shape}, "
             f"num_guide_frames={num_guide_frames}"

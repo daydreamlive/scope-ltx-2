@@ -14,10 +14,10 @@ LTX 2.3 is a 22B-parameter DiT (Diffusion Transformer) that generates synchroniz
 ## Features
 
 - **Audio–video generation** — synchronized video and audio from text prompts
-- **Modes** — **text** (default) and **video**; video mode supports **IC-LoRA** guide conditioning using a control video (e.g. depth / canny / pose) on the graph **video** input
+- **Modes** — **text** (default) and **video**; video mode supports guide conditioning using a reference video (e.g. depth / canny / pose / colorization) on the graph **video** input
 - **Image-to-video (I2V)** — optional reference image (`i2v_image`) with adjustable **I2V strength** (`i2v_strength`) to condition the first frame; set strength to `0` for pure text-to-video
-- **LoRA** — **permanent merge at load** into the FP8 transformer (dequantize → merge → requantize); zero runtime LoRA overhead; compatible with block streaming. Additional LoRA files go under your Scope models directory (e.g. `models/lora/`) and are selected via the pipeline **LoRA** UI or `loras` in `/load`
-- **IC-LoRA Union Control** — weights from [Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control) are downloaded with the pipeline; they are merged when you use video-mode guide conditioning (or you can list the safetensors explicitly in `loras`). Use **control strength** (`control_strength`) to blend the guide
+- **LoRA** — **permanent merge at load** into the FP8 transformer (dequantize → merge → requantize); zero runtime LoRA overhead; compatible with block streaming. LoRA files go under your Scope models directory (e.g. `models/lora/`) and are selected via the pipeline **LoRA** UI or `loras` in `/load`
+- **IC-LoRA support** — IC-LoRAs (In-Context LoRAs) are loaded like any other LoRA. Switch to **video mode** and provide reference frames to activate guide conditioning. `reference_downscale_factor` is read automatically from safetensors metadata. Compatible IC-LoRAs include [Union Control](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control), [Motion Track](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control), [Colorizer](https://huggingface.co/DoctorDiffusion/LTX-2.3-IC-LoRA-Colorizer), [Cameraman](https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-Cameraman_v1), [Outpaint](https://huggingface.co/oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint), and others. Use **control strength** (`control_strength`) to blend the guide
 - **Sampling** — default **8-step distilled** Euler schedule; optional schedules: `linear`, `cosine`, `linear_quadratic`, `beta`; configurable **denoising steps** (`num_steps`). Advanced: custom **`sigmas`** list (API) overrides step count and schedule
 - **Output constraints** — height/width snapped to **32**-pixel multiples; frame count snapped to **8×K+1** (minimum 9)
 - **Runs on 24GB GPUs** — FP8 weights in checkpoints, CPU-resident transformer blocks with double-buffered streaming to GPU
@@ -40,7 +40,6 @@ Weights are pulled from these Hugging Face repositories:
 |------------|----------|
 | [Kijai/LTX2.3_comfy](https://huggingface.co/Kijai/LTX2.3_comfy) | Transformer (22B distilled v3 FP8), text projection, video VAE, audio VAE (includes vocoder weights used at decode) |
 | [Comfy-Org/ltx-2](https://huggingface.co/Comfy-Org/ltx-2) | Gemma 3 12B FP8 text encoder (includes embedded SentencePiece tokenizer) |
-| [Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control) | IC-LoRA Union Control safetensors for video-mode guide conditioning |
 
 The Gemma model architecture config is bundled with this plugin — no separate download from `google/gemma-3-12b-it` is needed. The tokenizer is extracted at runtime from the FP8 checkpoint's embedded `spiece_model` tensor.
 
@@ -127,11 +126,11 @@ uv run download_models --pipeline ltx2
 | `lora_merge_strategy` | `"permanent_merge"` | Only `permanent_merge` is supported for this FP8 model |
 | `i2v_image` | — | Optional path or asset for image-to-video first-frame conditioning |
 | `i2v_strength` | 1.0 | 0 = no I2V conditioning, 1 = full first-frame conditioning |
-| `control_strength` | 1.0 | Video mode: IC-LoRA guide strength (0 = off, 1 = full) |
+| `control_strength` | 1.0 | Video mode: guide conditioning strength (0 = off, 1 = full) |
 | `ffn_chunk_size` | 4096 | FFN chunking for memory (smaller = less VRAM, more overhead; `null` disables) |
 | `sigmas` | — | **API:** custom descending sigma list; overrides `num_steps` and `schedule` |
 
-**LoRAs:** Pass `loras` as a list of `{ "path": "...", "scale": 1.0 }` in the `/load` body (paths are typically under your models tree). The IC-LoRA file is downloaded automatically; it is merged when guide video conditioning is used, unless you already included that file in `loras`.
+**LoRAs:** Pass `loras` as a list of `{ "path": "...", "scale": 1.0 }` in the `/load` body (paths are typically under your models tree). IC-LoRAs are treated as regular LoRAs — add them to `loras` and switch to video mode to activate guide conditioning.
 
 > [!NOTE]
 > Which parameters appear in the Scope UI depends on your Scope version. Anything exposed in the pipeline JSON schema can be set via `/load` if needed.

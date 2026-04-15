@@ -174,12 +174,6 @@ class LTX2Config(BasePipelineConfig):
             ],
         ),
         HuggingfaceRepoArtifact(
-            repo_id="Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control",
-            files=[
-                "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
-            ],
-        ),
-        HuggingfaceRepoArtifact(
             repo_id="AviadDahan/LTX-2.3-ID-LoRA-CelebVHQ-3K",
             files=[
                 "lora_weights.safetensors",
@@ -342,15 +336,15 @@ class LTX2Config(BasePipelineConfig):
         ),
     )
 
-    # IC-LoRA guide conditioning strength (video mode)
+    # Guide conditioning strength (video mode)
     control_strength: float = Field(
         default=1.0,
         ge=0.0,
         le=1.0,
         description=(
-            "IC-LoRA guide conditioning strength for video mode. "
+            "Guide conditioning strength for video mode. "
             "1.0 = fully conditioned, 0.0 = no conditioning. "
-            "Input video frames (depth/canny/pose) arrive via the video graph port."
+            "Reference video frames arrive via the video graph port."
         ),
         json_schema_extra=ui_field_config(
             order=12, label="Control Strength", is_load_param=False,

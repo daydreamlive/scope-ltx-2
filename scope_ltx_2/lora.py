@@ -77,8 +77,9 @@ def load_and_merge_loras(
     existing monkey-patched forward (``_fp8_scaled_forward``) stays correct.
 
     Returns a list of dicts with ``path``, ``scale``, and
-    ``reference_downscale_factor`` (extracted from safetensors metadata
-    for IC-LoRA checkpoints; defaults to ``1.0``).
+    ``reference_downscale_factor`` (extracted from safetensors metadata;
+    defaults to ``1.0``).  Used by guide conditioning to control the
+    resolution of reference latents.
     """
     if not lora_configs:
         return []
@@ -106,7 +107,7 @@ def load_and_merge_loras(
         try:
             reference_downscale_factor = float(metadata["reference_downscale_factor"])
             logger.info(
-                "IC-LoRA detected: reference_downscale_factor=%.1f from %s",
+                "LoRA reference_downscale_factor=%.1f from %s",
                 reference_downscale_factor, Path(path).name,
             )
         except (KeyError, ValueError, TypeError):

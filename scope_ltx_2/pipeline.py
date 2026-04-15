@@ -14,7 +14,13 @@ Memory Management (24GB GPU):
     - Between generations: streaming state (hooks, pinned memory) persists.
       Resident blocks are temporarily offloaded for VAE decode, then
       reloaded by pre-forward hooks on the next denoising pass.
-    - Full teardown only when text encoder needs to reload (prompt change).
+
+    Async Text Encoding:
+    - After the first (cold-start) GPU encode, Gemma is dequantized to
+      BF16 on CPU. Subsequent prompt changes are encoded entirely on CPU
+      in a background thread, so denoising is never interrupted.
+    - The generation loop keeps using the previous prompt's context tensor
+      until the background encode completes, then atomically swaps it in.
 
 Audio Support:
     LTX 2.3 natively supports synchronized audio-video generation.
@@ -24,7 +30,9 @@ import gc
 import json
 import logging
 import random
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -338,6 +346,15 @@ class LTX2Pipeline(Pipeline):
         self._streaming_state = None
         self._vaes_on_gpu = False
 
+        # Async text encoding state.  After the first GPU encode, Gemma is
+        # dequantized to BF16 on CPU so subsequent prompt changes run in a
+        # background thread without touching the GPU.
+        self._context_lock = threading.Lock()
+        self._bg_encode_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gemma-cpu")
+        self._bg_encode_future: Future | None = None
+        self._bg_encode_prompt: str | None = None
+        self._cpu_text_encoder_ready = False
+
         # Running media-time cursor (in 90 kHz ticks) shared by video and
         # audio timestamps.  Each chunk advances it by the chunk's duration
         # so downstream WebRTC pacing keeps bursty output chunks monotonic
@@ -361,6 +378,19 @@ class LTX2Pipeline(Pipeline):
         generation aborts at the next denoising step.
         """
         self._cancelled = True
+
+        # Shut down background text encoding before touching any models.
+        executor = getattr(self, "_bg_encode_executor", None)
+        if executor is not None:
+            future = getattr(self, "_bg_encode_future", None)
+            if future is not None and not future.done():
+                future.cancel()
+                try:
+                    future.result(timeout=5)
+                except Exception:
+                    pass
+            executor.shutdown(wait=False)
+            self._bg_encode_future = None
 
         if torch.cuda.is_available():
             try:
@@ -407,8 +437,9 @@ class LTX2Pipeline(Pipeline):
             except AttributeError:
                 pass
 
-        self._cached_context = None
-        self._cached_prompt_text = None
+        with self._context_lock:
+            self._cached_context = None
+            self._cached_prompt_text = None
         self._streaming_state = None
 
         gc.collect()
@@ -494,6 +525,200 @@ class LTX2Pipeline(Pipeline):
         _move_module_to(self._text_encoder, self.device)
         self._text_encoder_on_gpu = True
         _log_gpu_memory("gemma reloaded")
+
+    # ------------------------------------------------------------------
+    # Async CPU text encoding
+    # ------------------------------------------------------------------
+
+    def _prepare_cpu_text_encoder(self):
+        """Dequantize FP8 Gemma weights to BF16 for CPU inference.
+
+        Called once after the first GPU encode.  Walks every linear layer
+        that was monkey-patched by ``patch_fp8_layers`` and replaces the
+        FP8 weight with ``weight * weight_scale`` in BF16, restoring the
+        original ``nn.Linear.forward``.  The model is then usable on CPU
+        without ``torch._scaled_mm``.
+        """
+        if self._cpu_text_encoder_ready:
+            return
+
+        t0 = time.time()
+        if self._text_encoder_on_gpu:
+            self._offload_text_encoder()
+
+        import types as _types
+        dequantized = 0
+        for name, module in self._text_encoder.named_modules():
+            if not isinstance(module, torch.nn.Linear):
+                continue
+            if module.weight.dtype != torch.float8_e4m3fn:
+                continue
+            if not hasattr(module, "_fp8_weight_scale"):
+                continue
+
+            ws = module._fp8_weight_scale.float()
+            module.weight.data = (module.weight.data.float() * ws).to(self.dtype)
+            del module._fp8_weight_scale
+            if hasattr(module, "_fp8_input_scale"):
+                del module._fp8_input_scale
+            # Restore default nn.Linear.forward
+            if hasattr(module, "forward") and isinstance(
+                module.forward, _types.MethodType
+            ):
+                try:
+                    delattr(module, "forward")
+                except AttributeError:
+                    module.forward = _types.MethodType(
+                        torch.nn.Linear.forward, module
+                    )
+            dequantized += 1
+
+        self._cpu_text_encoder_ready = True
+        elapsed = time.time() - t0
+        mem_gb = sum(
+            p.numel() * p.element_size() for p in self._text_encoder.parameters()
+        ) / 1024**3
+        logger.info(
+            f"CPU text encoder ready: dequantized {dequantized} FP8 layers "
+            f"to {self.dtype} in {elapsed:.1f}s ({mem_gb:.1f} GB RAM)"
+        )
+
+    @torch.inference_mode()
+    def _encode_prompt_on_cpu(self, prompt_text: str) -> torch.Tensor:
+        """Run the full text encoding pipeline on CPU.
+
+        Returns a ``context`` tensor (on CPU) ready to be moved to GPU for
+        denoising.  This is called from the background thread.
+        """
+        from .text_encoder import encode_prompt
+
+        cpu = torch.device("cpu")
+
+        all_layer_hiddens = encode_prompt(
+            self._text_encoder,
+            self._tokenizer,
+            prompt_text,
+            device=cpu,
+            dtype=self.dtype,
+        )
+        logger.info(f"[bg] Gemma CPU encoding done: {all_layer_hiddens.shape}")
+
+        projected = self._text_projection(all_layer_hiddens)
+        del all_layer_hiddens
+        logger.info(f"[bg] Text projection done: {projected.shape}")
+
+        context = self._transformer.preprocess_text_embeds(projected, unprocessed=True)
+        del projected
+        logger.info(f"[bg] Context ready: {context.shape}")
+
+        return context
+
+    def _start_background_encode(self, prompt_text: str):
+        """Submit a prompt for background CPU encoding.
+
+        If a background encode is already running for a different prompt,
+        it is cancelled (only the latest prompt matters).
+        """
+        if self._bg_encode_prompt == prompt_text:
+            return
+
+        old_future = self._bg_encode_future
+        if old_future is not None and not old_future.done():
+            old_future.cancel()
+            logger.info(f"[bg] Cancelled stale encode for: {self._bg_encode_prompt!r:.60s}")
+
+        self._bg_encode_prompt = prompt_text
+        logger.info(f"[bg] Starting CPU encode for: {prompt_text[:80]}...")
+
+        def _encode_task():
+            t0 = time.time()
+            try:
+                ctx = self._encode_prompt_on_cpu(prompt_text)
+                elapsed = time.time() - t0
+                logger.info(f"[bg] CPU encode finished in {elapsed:.1f}s")
+                return ctx
+            except Exception:
+                logger.exception("[bg] CPU encode failed")
+                raise
+
+        self._bg_encode_future = self._bg_encode_executor.submit(_encode_task)
+
+    def _check_background_encode(self) -> bool:
+        """Check if a background encode has completed and swap context.
+
+        Returns True if a new context was swapped in.
+        """
+        future = self._bg_encode_future
+        if future is None or not future.done():
+            return False
+
+        try:
+            context_cpu = future.result(timeout=0)
+        except Exception:
+            logger.warning("[bg] Background encode failed, discarding")
+            self._bg_encode_future = None
+            self._bg_encode_prompt = None
+            return False
+
+        context = context_cpu.to(device=self.device)
+        with self._context_lock:
+            self._cached_context = context
+            self._cached_prompt_text = self._bg_encode_prompt
+        self._bg_encode_future = None
+        logger.info(f"[bg] Swapped in new context for: {self._bg_encode_prompt!r:.60s}")
+        return True
+
+    def _encode_prompt_gpu_blocking(self, prompt_text: str) -> torch.Tensor:
+        """Blocking GPU encode path — minimal teardown variant.
+
+        Used for cold-start (no cached context yet) and as a fallback.
+        When streaming state exists, only offloads resident blocks instead
+        of a full teardown, preserving hooks and pinned memory so the next
+        denoising pass doesn't need a full rebuild.
+        """
+        from .text_encoder import encode_prompt
+
+        if self._streaming_state is not None:
+            # Lighter path: keep streaming hooks and scaffold, only free
+            # resident blocks to make room for Gemma.
+            self._free_blocks_for_decode()
+            self._offload_vaes()
+        else:
+            self._teardown_denoising()
+            self._offload_vaes()
+
+        self._load_text_encoder()
+
+        all_layer_hiddens = encode_prompt(
+            self._text_encoder,
+            self._tokenizer,
+            prompt_text,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        logger.info(f"Gemma encoding done: {all_layer_hiddens.shape}")
+
+        self._offload_text_encoder()
+
+        self._text_projection.to(self.device)
+        projected = self._text_projection(all_layer_hiddens)
+        self._text_projection.to("cpu")
+        del all_layer_hiddens
+        logger.info(f"Text projection done: {projected.shape}")
+
+        self._move_connectors_to_gpu()
+        context = self._transformer.preprocess_text_embeds(projected, unprocessed=True)
+        self._move_connectors_to_cpu()
+
+        del projected
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        with self._context_lock:
+            self._cached_prompt_text = prompt_text
+            self._cached_context = context
+        _log_gpu_memory("text encoding complete (GPU)")
+        return context
 
     def _move_vaes_to_gpu(self):
         """Move all VAE models to GPU and keep them resident.
@@ -686,7 +911,26 @@ class LTX2Pipeline(Pipeline):
     # Inference
     # ------------------------------------------------------------------
 
+    def preempt_encode(self, prompt_text: str):
+        """Start background encoding for a prompt before the next generation.
+
+        Can be called from external code (e.g. parameter update handlers)
+        as soon as a new prompt arrives.  If the CPU encoder is ready and
+        the prompt differs from the current cache, a background encode is
+        started immediately, giving it a head start before the next
+        ``_generate()`` call.  Safe to call from any thread.
+        """
+        if not self._cpu_text_encoder_ready:
+            return
+        with self._context_lock:
+            if self._cached_prompt_text == prompt_text:
+                return
+        self._start_background_encode(prompt_text)
+
     def __call__(self, **kwargs) -> dict:
+        prompts = kwargs.get("prompts")
+        if prompts:
+            self.preempt_encode(prompts[0].get("text", ""))
         return self._generate(**kwargs)
 
     def _advance_chunk_timestamps(
@@ -786,8 +1030,6 @@ class LTX2Pipeline(Pipeline):
 
     @torch.inference_mode()
     def _generate(self, **kwargs) -> dict:
-        from .text_encoder import encode_prompt
-
         from .schema import VAE_SPATIAL_FACTOR, make_sigma_schedule, snap_frame_count, snap_to_multiple
 
         prompts = kwargs.get("prompts", [{"text": "a beautiful sunset", "weight": 1.0}])
@@ -820,48 +1062,36 @@ class LTX2Pipeline(Pipeline):
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # =================================================================
-        # Text encoding (Gemma FP8 on GPU -> offload -> connectors)
+        # Text encoding — async CPU path after first encode
         # =================================================================
-        if self._cached_prompt_text == prompt_text and self._cached_context is not None:
+        # Pick up any completed background encode first.
+        self._check_background_encode()
+
+        with self._context_lock:
+            prompt_matches = (
+                self._cached_prompt_text == prompt_text
+                and self._cached_context is not None
+            )
+
+        if prompt_matches:
             context = self._cached_context
             logger.debug("Reusing cached prompt encoding")
-        else:
-            logger.info(f"Encoding prompt: {prompt_text[:80]}...")
-
-            # Gemma needs ~13 GB — free everything else first
-            self._teardown_denoising()
-            self._offload_vaes()
-
-            self._load_text_encoder()
-
-            all_layer_hiddens = encode_prompt(
-                self._text_encoder,
-                self._tokenizer,
-                prompt_text,
-                device=self.device,
-                dtype=self.dtype,
+        elif self._cached_context is not None and self._cpu_text_encoder_ready:
+            # A previous generation has run, so the CPU encoder is ready.
+            # Kick off async encoding and keep generating with old context.
+            self._start_background_encode(prompt_text)
+            context = self._cached_context
+            logger.info(
+                f"Prompt changed, background CPU encode started. "
+                f"Continuing with previous context."
             )
-            logger.info(f"Gemma encoding done: {all_layer_hiddens.shape}")
-
-            self._offload_text_encoder()
-
-            self._text_projection.to(self.device)
-            projected = self._text_projection(all_layer_hiddens)
-            self._text_projection.to("cpu")
-            del all_layer_hiddens
-            logger.info(f"Text projection done: {projected.shape}")
-
-            self._move_connectors_to_gpu()
-            context = self._transformer.preprocess_text_embeds(projected, unprocessed=True)
-            self._move_connectors_to_cpu()
-
-            del projected
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            self._cached_prompt_text = prompt_text
-            self._cached_context = context
-            _log_gpu_memory("text encoding complete")
+        else:
+            # Cold start (first ever encode) — use the blocking GPU path.
+            # No denoising is running yet so the full swap is fine.
+            logger.info(f"Encoding prompt (GPU, cold start): {prompt_text[:80]}...")
+            context = self._encode_prompt_gpu_blocking(prompt_text)
+            # Prepare CPU encoder for subsequent async encodes.
+            self._prepare_cpu_text_encoder()
 
         # Move VAEs to GPU before denoising setup so the streaming config
         # accounts for their memory in the available VRAM budget.

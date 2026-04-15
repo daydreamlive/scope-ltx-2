@@ -353,6 +353,7 @@ class LTX2Pipeline(Pipeline):
         self._bg_encode_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gemma-cpu")
         self._bg_encode_future: Future | None = None
         self._bg_encode_prompt: str | None = None
+        self._bg_encode_cancel = threading.Event()
         self._cpu_text_encoder_ready = False
 
         # Running media-time cursor (in 90 kHz ticks) shared by video and
@@ -380,16 +381,21 @@ class LTX2Pipeline(Pipeline):
         self._cancelled = True
 
         # Shut down background text encoding before touching any models.
+        # Signal the cancellation event so an in-flight encode aborts
+        # between stages, then wait for the task to finish.
+        cancel_evt = getattr(self, "_bg_encode_cancel", None)
+        if cancel_evt is not None:
+            cancel_evt.set()
         executor = getattr(self, "_bg_encode_executor", None)
         if executor is not None:
             future = getattr(self, "_bg_encode_future", None)
             if future is not None and not future.done():
                 future.cancel()
                 try:
-                    future.result(timeout=5)
+                    future.result(timeout=30)
                 except Exception:
                     pass
-            executor.shutdown(wait=False)
+            executor.shutdown(wait=True, cancel_futures=True)
             self._bg_encode_future = None
 
         if torch.cuda.is_available():
@@ -588,11 +594,16 @@ class LTX2Pipeline(Pipeline):
         """Run the full text encoding pipeline on CPU.
 
         Returns a ``context`` tensor (on CPU) ready to be moved to GPU for
-        denoising.  This is called from the background thread.
+        denoising.  This is called from the background thread.  Checks
+        ``_bg_encode_cancel`` between stages so ``unload()`` can abort
+        without waiting for the full ~3-minute encode.
         """
         from .text_encoder import encode_prompt
 
         cpu = torch.device("cpu")
+
+        if self._bg_encode_cancel.is_set():
+            raise RuntimeError("Background encode cancelled")
 
         all_layer_hiddens = encode_prompt(
             self._text_encoder,
@@ -603,9 +614,15 @@ class LTX2Pipeline(Pipeline):
         )
         logger.info(f"[bg] Gemma CPU encoding done: {all_layer_hiddens.shape}")
 
+        if self._bg_encode_cancel.is_set():
+            raise RuntimeError("Background encode cancelled")
+
         projected = self._text_projection(all_layer_hiddens)
         del all_layer_hiddens
         logger.info(f"[bg] Text projection done: {projected.shape}")
+
+        if self._bg_encode_cancel.is_set():
+            raise RuntimeError("Background encode cancelled")
 
         context = self._transformer.preprocess_text_embeds(projected, unprocessed=True)
         del projected
@@ -617,8 +634,12 @@ class LTX2Pipeline(Pipeline):
         """Submit a prompt for background CPU encoding.
 
         If a background encode is already running for a different prompt,
-        it is cancelled (only the latest prompt matters).
+        it is cancelled (only the latest prompt matters).  Skips if the
+        prompt is already cached or already being encoded.
         """
+        with self._context_lock:
+            if self._cached_prompt_text == prompt_text and self._cached_context is not None:
+                return
         if self._bg_encode_prompt == prompt_text:
             return
 
@@ -627,6 +648,7 @@ class LTX2Pipeline(Pipeline):
             old_future.cancel()
             logger.info(f"[bg] Cancelled stale encode for: {self._bg_encode_prompt!r:.60s}")
 
+        self._bg_encode_cancel.clear()
         self._bg_encode_prompt = prompt_text
         logger.info(f"[bg] Starting CPU encode for: {prompt_text[:80]}...")
 

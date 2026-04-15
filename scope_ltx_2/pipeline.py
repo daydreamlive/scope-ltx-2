@@ -255,7 +255,7 @@ class LTX2Pipeline(Pipeline):
         comfy_dir = get_model_file_path("ltx-2")
 
         if transformer_path is None:
-            transformer_path = str(kijai_dir / "diffusion_models" / "ltx-2.3-22b-distilled_transformer_only_fp8_input_scaled_v3.safetensors")
+            transformer_path = str(kijai_dir / "diffusion_models" / "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors")
         if text_projection_path is None:
             text_projection_path = str(kijai_dir / "text_encoders" / "ltx-2.3_text_projection_bf16.safetensors")
         if video_vae_path is None:
@@ -306,9 +306,9 @@ class LTX2Pipeline(Pipeline):
 
         # Step 3c: Detect ID-LoRA for deferred merge.
         # ID-LoRA is merged on first use of audio_mode="id_lora".
-        ID_LORA_FILENAME = "lora_weights.safetensors"
+        ID_LORA_FILENAME = "ltx-2.3-id-lora-talkvid-3k.safetensors"
         id_lora_path = get_model_file_path(
-            f"LTX-2.3-ID-LoRA-CelebVHQ-3K/{ID_LORA_FILENAME}"
+            f"ltx-2.3/split_files/loras/{ID_LORA_FILENAME}"
         )
         already_has_id_lora = any(
             "ID-LoRA" in (cfg.get("path") or "") for cfg in loras
@@ -441,8 +441,8 @@ class LTX2Pipeline(Pipeline):
         if self._pending_id_lora is None:
             logger.warning(
                 "ID-LoRA mode requested but no ID-LoRA weights found. "
-                "Download from https://huggingface.co/AviadDahan/LTX-2.3-ID-LoRA-CelebVHQ-3K "
-                "and place lora_weights.safetensors in models/LTX-2.3-ID-LoRA-CelebVHQ-3K/"
+                "Download from https://huggingface.co/Comfy-Org/ltx-2.3 "
+                "and place ltx-2.3-id-lora-talkvid-3k.safetensors in models/ltx-2.3/split_files/loras/"
             )
             return
 

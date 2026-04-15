@@ -161,7 +161,7 @@ class LTX2Config(BasePipelineConfig):
         HuggingfaceRepoArtifact(
             repo_id="Kijai/LTX2.3_comfy",
             files=[
-                "diffusion_models/ltx-2.3-22b-distilled_transformer_only_fp8_input_scaled_v3.safetensors",
+                "diffusion_models/ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors",
                 "text_encoders/ltx-2.3_text_projection_bf16.safetensors",
                 "vae/LTX23_video_vae_bf16.safetensors",
                 "vae/LTX23_audio_vae_bf16.safetensors",
@@ -174,9 +174,9 @@ class LTX2Config(BasePipelineConfig):
             ],
         ),
         HuggingfaceRepoArtifact(
-            repo_id="AviadDahan/LTX-2.3-ID-LoRA-CelebVHQ-3K",
+            repo_id="Comfy-Org/ltx-2.3",
             files=[
-                "lora_weights.safetensors",
+                "split_files/loras/ltx-2.3-id-lora-talkvid-3k.safetensors",
             ],
         ),
     ]

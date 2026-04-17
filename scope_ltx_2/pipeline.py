@@ -216,6 +216,7 @@ class LTX2Pipeline(Pipeline):
         gemma_model_path: str | None = None,
         ffn_chunk_size: int | None = 4096,
         loras: list[dict] | None = None,
+        realtime_pacing_slack: float = 0.0,
         **kwargs,
     ):
         from .model_loader import load_transformer
@@ -244,6 +245,7 @@ class LTX2Pipeline(Pipeline):
         self.schedule = schedule
         self.sigmas = sigmas if sigmas is not None else make_sigma_schedule(num_steps, schedule)
         self.ffn_chunk_size = ffn_chunk_size
+        self.realtime_pacing_slack = realtime_pacing_slack
 
         if kwargs:
             logger.debug(f"LTX2Pipeline ignoring unknown kwargs: {list(kwargs.keys())}")
@@ -344,6 +346,13 @@ class LTX2Pipeline(Pipeline):
         # and A/V locked.
         self._media_ticks = 0
 
+        # Realtime pacing anchor.  Established at the end of the first
+        # batch and re-established after any slow, non-steady-state phase
+        # (e.g. prompt change) by setting ``_wall_clock_start = None``.
+        # See ``_realtime_throttle``.
+        self._wall_clock_start: float | None = None
+        self._media_ticks_at_anchor: int = 0
+
         logger.info(f"LTX 2.3 pipeline loaded in {time.time() - start:.1f}s")
         _log_gpu_memory("all loaded")
 
@@ -410,6 +419,9 @@ class LTX2Pipeline(Pipeline):
         self._cached_context = None
         self._cached_prompt_text = None
         self._streaming_state = None
+
+        self._wall_clock_start = None
+        self._media_ticks_at_anchor = 0
 
         gc.collect()
         if torch.cuda.is_available():
@@ -727,6 +739,29 @@ class LTX2Pipeline(Pipeline):
         self._media_ticks = base_ticks + int(round(chunk_duration_ticks))
         return video_ts, audio_ts
 
+    def _realtime_throttle(self, slack: float) -> None:
+        """Back-pressure to keep media production near wall-clock pace.
+
+        If ``slack > 0`` and the media time produced since the last anchor has
+        run more than ``(1 + slack)`` faster than wall-clock, sleep until the
+        two are back at parity (ratio 1.0).
+
+        The anchor is established after the first batch and after any slow
+        action (e.g. a prompt change that reloads the text encoder), so
+        those large one-off costs don't inflate the realtime budget.
+        """
+        if slack <= 0.0:
+            return
+        now = time.monotonic()
+        if self._wall_clock_start is None:
+            self._wall_clock_start = now
+            self._media_ticks_at_anchor = self._media_ticks
+            return
+        media_elapsed = (self._media_ticks - self._media_ticks_at_anchor) / _VIDEO_CLOCK_RATE
+        wall_elapsed = now - self._wall_clock_start
+        if media_elapsed > wall_elapsed * (1.0 + slack):
+            time.sleep(media_elapsed - wall_elapsed)
+
     def _ensure_denoising_ready(self, total_tokens: int = 0):
         """Ensure scaffold and block streaming are set up on GPU.
 
@@ -827,6 +862,12 @@ class LTX2Pipeline(Pipeline):
             logger.debug("Reusing cached prompt encoding")
         else:
             logger.info(f"Encoding prompt: {prompt_text[:80]}...")
+
+            # Prompt change triggers a slow path (Gemma reload, re-encode).
+            # Clear the pacing anchor so that one-off cost isn't charged
+            # against the realtime budget; the next completed batch will
+            # re-anchor at its end.
+            self._wall_clock_start = None
 
             # Gemma needs ~13 GB — free everything else first
             self._teardown_denoising()
@@ -1031,6 +1072,9 @@ class LTX2Pipeline(Pipeline):
                 audio_samples=cancelled_audio.shape[-1],
                 audio_sample_rate=cancelled_sample_rate,
             )
+            self._realtime_throttle(
+                kwargs.get("realtime_pacing_slack", self.realtime_pacing_slack)
+            )
             return {
                 "video": cancelled_video,
                 "video_timestamps": video_timestamps,
@@ -1088,6 +1132,10 @@ class LTX2Pipeline(Pipeline):
             num_frames=video_tensor.shape[0],
             audio_samples=audio_tensor.shape[-1],
             audio_sample_rate=audio_sample_rate,
+        )
+
+        self._realtime_throttle(
+            kwargs.get("realtime_pacing_slack", self.realtime_pacing_slack)
         )
 
         return {

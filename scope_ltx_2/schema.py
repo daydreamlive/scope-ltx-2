@@ -159,24 +159,14 @@ class LTX2Config(BasePipelineConfig):
 
     artifacts = [
         HuggingfaceRepoArtifact(
-            repo_id="Kijai/LTX2.3_comfy",
+            repo_id="daydreamlive/LTX2.3",
             files=[
                 "diffusion_models/ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors",
                 "text_encoders/ltx-2.3_text_projection_bf16.safetensors",
+                "text_encoders/gemma_3_12B_it_fp8_scaled.safetensors",
                 "vae/LTX23_video_vae_bf16.safetensors",
                 "vae/LTX23_audio_vae_bf16.safetensors",
-            ],
-        ),
-        HuggingfaceRepoArtifact(
-            repo_id="Comfy-Org/ltx-2",
-            files=[
-                "split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors",
-            ],
-        ),
-        HuggingfaceRepoArtifact(
-            repo_id="Comfy-Org/ltx-2.3",
-            files=[
-                "split_files/loras/ltx-2.3-id-lora-talkvid-3k.safetensors",
+                "loras/ltx-2.3-id-lora-talkvid-3k.safetensors",
             ],
         ),
     ]

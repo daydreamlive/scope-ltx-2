@@ -24,6 +24,7 @@ import gc
 import json
 import logging
 import random
+import shutil
 import time
 from fractions import Fraction
 from pathlib import Path
@@ -75,6 +76,49 @@ def _load_sd_with_prefix_replace(
                     sd[new_key] = v.to(dtype=dtype) if dtype is not None else v
                     break
     return sd
+
+# TODO: WE can remove this migration eventually, it's only to help users not redownload
+
+_OLD_TO_NEW_FILE_MAP: list[tuple[str, str]] = [
+    # Kijai/LTX2.3_comfy → daydreamlive/LTX2.3
+    ("LTX2.3_comfy/diffusion_models/ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors",
+     "diffusion_models/ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors"),
+    ("LTX2.3_comfy/text_encoders/ltx-2.3_text_projection_bf16.safetensors",
+     "text_encoders/ltx-2.3_text_projection_bf16.safetensors"),
+    ("LTX2.3_comfy/vae/LTX23_video_vae_bf16.safetensors",
+     "vae/LTX23_video_vae_bf16.safetensors"),
+    ("LTX2.3_comfy/vae/LTX23_audio_vae_bf16.safetensors",
+     "vae/LTX23_audio_vae_bf16.safetensors"),
+    # Comfy-Org/ltx-2 → daydreamlive/LTX2.3
+    ("ltx-2/split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors",
+     "text_encoders/gemma_3_12B_it_fp8_scaled.safetensors"),
+    # Comfy-Org/ltx-2.3 → daydreamlive/LTX2.3
+    ("ltx-2.3/split_files/loras/ltx-2.3-id-lora-talkvid-3k.safetensors",
+     "loras/ltx-2.3-id-lora-talkvid-3k.safetensors"),
+]
+
+
+def _migrate_old_model_files(new_dir: Path) -> None:
+    """Copy model files from the old multi-repo layout into the new unified directory.
+
+    Runs once per load; skips files that already exist at the destination.
+    Uses copy (not move) so a rollback to the previous version still works.
+    """
+    from scope.core.config import get_models_dir
+
+    models_dir = get_models_dir()
+    copied_any = False
+    for old_rel, new_rel in _OLD_TO_NEW_FILE_MAP:
+        src = models_dir / old_rel
+        dst = new_dir / new_rel
+        if dst.exists() or not src.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        logger.info("Migrating %s → %s", src, dst)
+        shutil.copy2(src, dst)
+        copied_any = True
+    if copied_any:
+        logger.info("Model migration complete — old files left in place for rollback safety.")
 
 
 def _log_gpu_memory(stage: str) -> None:
@@ -252,26 +296,26 @@ class LTX2Pipeline(Pipeline):
 
         start = time.time()
 
-        # Resolve model paths
-        kijai_dir = get_model_file_path("LTX2.3_comfy")
-        comfy_dir = get_model_file_path("ltx-2")
+        # Resolve model paths — new unified directory
+        model_dir = get_model_file_path("LTX2.3")
+        _migrate_old_model_files(model_dir)
 
         if transformer_path is None:
-            transformer_path = str(kijai_dir / "diffusion_models" / "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors")
+            transformer_path = str(model_dir / "diffusion_models" / "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors")
         if text_projection_path is None:
-            text_projection_path = str(kijai_dir / "text_encoders" / "ltx-2.3_text_projection_bf16.safetensors")
+            text_projection_path = str(model_dir / "text_encoders" / "ltx-2.3_text_projection_bf16.safetensors")
         if video_vae_path is None:
-            video_vae_path = str(kijai_dir / "vae" / "LTX23_video_vae_bf16.safetensors")
+            video_vae_path = str(model_dir / "vae" / "LTX23_video_vae_bf16.safetensors")
         if audio_vae_path is None:
-            audio_vae_path = str(kijai_dir / "vae" / "LTX23_audio_vae_bf16.safetensors")
+            audio_vae_path = str(model_dir / "vae" / "LTX23_audio_vae_bf16.safetensors")
         if gemma_model_path is None:
-            fp8_path = comfy_dir / "split_files" / "text_encoders" / "gemma_3_12B_it_fp8_scaled.safetensors"
+            fp8_path = model_dir / "text_encoders" / "gemma_3_12B_it_fp8_scaled.safetensors"
             if fp8_path.exists():
                 gemma_model_path = str(fp8_path)
             else:
                 raise FileNotFoundError(
                     f"FP8 Gemma checkpoint not found at {fp8_path}. "
-                    "Download it from Comfy-Org/ltx-2 on HuggingFace."
+                    "Download it from daydreamlive/LTX2.3 on HuggingFace."
                 )
 
         logger.info(f"Transformer: {transformer_path}")
@@ -309,9 +353,7 @@ class LTX2Pipeline(Pipeline):
         # Step 3c: Detect ID-LoRA for deferred merge.
         # ID-LoRA is merged on first use of audio_mode="id_lora".
         ID_LORA_FILENAME = "ltx-2.3-id-lora-talkvid-3k.safetensors"
-        id_lora_path = get_model_file_path(
-            f"ltx-2.3/split_files/loras/{ID_LORA_FILENAME}"
-        )
+        id_lora_path = model_dir / "loras" / ID_LORA_FILENAME
         already_has_id_lora = any(
             "ID-LoRA" in (cfg.get("path") or "") for cfg in loras
         )
@@ -453,8 +495,8 @@ class LTX2Pipeline(Pipeline):
         if self._pending_id_lora is None:
             logger.warning(
                 "ID-LoRA mode requested but no ID-LoRA weights found. "
-                "Download from https://huggingface.co/Comfy-Org/ltx-2.3 "
-                "and place ltx-2.3-id-lora-talkvid-3k.safetensors in models/ltx-2.3/split_files/loras/"
+                "Download from https://huggingface.co/daydreamlive/LTX2.3 "
+                "and place ltx-2.3-id-lora-talkvid-3k.safetensors in models/LTX2.3/loras/"
             )
             return
 

@@ -294,6 +294,19 @@ class LTX2Config(BasePipelineConfig):
 
     frame_rate: float = 24.0
 
+    realtime_pacing_slack: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "If > 0, sleep after each generated batch when accumulated media time "
+            "exceeds wall-clock by more than this fraction. Prevents unbounded "
+            "playback backlog when inference runs faster than realtime. "
+            "Example: 0.1 allows media to run up to 10% ahead of wall-clock "
+            "before throttling back to match the expected wall-clock. "
+            "0 disables pacing."
+        ),
+    )
+
     # FFN chunking for memory-efficient inference
     ffn_chunk_size: int | None = Field(
         default=4096,

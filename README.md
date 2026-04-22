@@ -8,9 +8,6 @@
 
 LTX 2.3 is a 22B-parameter DiT (Diffusion Transformer) that generates synchronized video and audio from text prompts. This plugin uses ComfyUI-derived model loading and inference code with [Kijai's separated FP8 checkpoints](https://huggingface.co/Kijai/LTX2.3_comfy), enabling it to run on a single **24GB GPU**.
 
-> [!IMPORTANT]
-> Plugin support is a preview feature in Scope; APIs may change before a stable release. Use a Scope build that includes plugin support ([manual installation](https://github.com/daydreamlive/scope/tree/main?tab=readme-ov-file#manual-installation)).
-
 ## Features
 
 - **Audio–video generation** — synchronized video and audio from text prompts
@@ -45,30 +42,61 @@ The Gemma model architecture config is bundled with this plugin — no separate 
 
 ## Install
 
-Follow the [manual installation](https://github.com/daydreamlive/scope/tree/main?tab=readme-ov-file#manual-installation) instructions for Scope (plugin support for the desktop app is not available yet).
+### Desktop App
 
-Install the plugin within the `scope` directory:
+1. Open **Settings** → **Plugins** tab.
+2. Paste the following into the installation input field:
 
-```bash
-DAYDREAM_SCOPE_PREVIEW=1 uv run daydream-scope install git+https://github.com/daydreamlive/scope-ltx-2.git
+   ```
+   https://github.com/daydreamlive/scope-ltx-2
+   ```
+
+3. Click **Install** and wait for the server to restart.
+
+The plugin and its `ltx2` pipeline will appear automatically once the restart completes. See the [Plugins guide](https://github.com/daydreamlive/scope/blob/main/docs/plugins.md#using-plugins-from-the-desktop-app) for more detail.
+
+### Manual Installation (CLI)
+
+Follow the [manual installation](https://github.com/daydreamlive/scope/tree/main?tab=readme-ov-file#manual-installation) instructions for Scope, then install the plugin from the `scope` directory:
+
+```
+uv run daydream-scope install https://github.com/daydreamlive/scope-ltx-2
 ```
 
-Confirm that the plugin is installed:
+Confirm the plugin is installed:
 
-```bash
-DAYDREAM_SCOPE_PREVIEW=1 uv run daydream-scope plugins
+```
+uv run daydream-scope plugins
 ```
 
-Confirm that the `ltx2` pipeline is available:
+Confirm the `ltx2` pipeline is available:
 
-```bash
-DAYDREAM_SCOPE_PREVIEW=1 uv run daydream-scope pipelines
+```
+uv run daydream-scope pipelines
 ```
 
 ## Upgrade
 
-```bash
-DAYDREAM_SCOPE_PREVIEW=1 uv run daydream-scope install --upgrade git+https://github.com/daydreamlive/scope-ltx-2.git
+### Desktop App
+
+Open **Settings** → **Plugins** tab. If an update is available, an **Update** button appears next to the plugin — click it and wait for the server to restart.
+
+### CLI
+
+```
+uv run daydream-scope install --upgrade https://github.com/daydreamlive/scope-ltx-2
+```
+
+## Uninstall
+
+### Desktop App
+
+Open **Settings** → **Plugins** tab and click the trash icon next to the plugin.
+
+### CLI
+
+```
+uv run daydream-scope uninstall scope-ltx-2
 ```
 
 ## Usage

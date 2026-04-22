@@ -123,6 +123,8 @@ class BlockStreamingState:
             self._offload_stream.synchronize()
         self._transfer_stream = None
         self._offload_stream = None
+        self._pinned_params = [{} for _ in range(self.num_blocks)]
+        self.blocks = None
 
 
 class _nullcontext:
@@ -259,9 +261,13 @@ def cleanup_block_streaming(
             for param in block.parameters():
                 if param.device != target:
                     param.data = param.data.to(target, non_blocking=True)
+                elif target.type == "cpu" and param.data.is_pinned():
+                    param.data = param.data.clone()
             for buf in block.buffers():
                 if buf.device != target:
                     buf.data = buf.data.to(target, non_blocking=True)
+                elif target.type == "cpu" and buf.data.is_pinned():
+                    buf.data = buf.data.clone()
         if target.type == "cuda":
             torch.cuda.synchronize(target)
 

@@ -295,6 +295,9 @@ class LTX2Config(BasePipelineConfig):
             "before throttling back to match the expected wall-clock. "
             "0 disables pacing."
         ),
+        json_schema_extra=ui_field_config(
+            order=8, label="Realtime Pacing Slack", is_load_param=False
+        ),
     )
 
     # FFN chunking for memory-efficient inference

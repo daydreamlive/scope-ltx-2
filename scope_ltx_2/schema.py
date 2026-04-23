@@ -285,7 +285,7 @@ class LTX2Config(BasePipelineConfig):
     frame_rate: float = 24.0
 
     realtime_pacing_slack: float = Field(
-        default=0.0,
+        default=30.0,
         ge=0.0,
         description=(
             "If > 0, sleep after each generated batch when accumulated media time "

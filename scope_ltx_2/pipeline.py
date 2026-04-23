@@ -1247,12 +1247,13 @@ class LTX2Pipeline(Pipeline):
 
     def _cleanup_block_streaming(self):
         """Clean up block streaming and move all blocks back to CPU."""
-        if self._streaming_state is None:
+        streaming_state = getattr(self, '_streaming_state', None)
+        if streaming_state is None:
             return
         from scope_ltx_2.weight_streaming import cleanup_block_streaming
         cleanup_block_streaming(
             self._transformer.transformer_blocks,
-            self._streaming_state,
+            streaming_state,
             move_to="cpu",
         )
         self._streaming_state = None

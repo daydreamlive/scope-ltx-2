@@ -382,6 +382,12 @@ class LTX2Pipeline(Pipeline):
         self._streaming_state = None
         self._vaes_on_gpu = False
 
+        # Last-chunk replay: when a prompt changes we replay the previous
+        # chunk's output while encoding the new prompt, so the user sees
+        # continuous playback instead of a stall.
+        self._last_output: dict | None = None
+        self._prompt_interrupted = False
+
         # Running media-time cursor (in 90 kHz ticks) shared by video and
         # audio timestamps.  Each chunk advances it by the chunk's duration
         # so downstream WebRTC pacing keeps bursty output chunks monotonic
@@ -461,6 +467,8 @@ class LTX2Pipeline(Pipeline):
         self._cached_context = None
         self._cached_prompt_text = None
         self._streaming_state = None
+        self._last_output = None
+        self._prompt_interrupted = False
 
         self._wall_clock_start = None
         self._media_ticks_at_anchor = 0
@@ -741,7 +749,58 @@ class LTX2Pipeline(Pipeline):
     # ------------------------------------------------------------------
 
     def __call__(self, **kwargs) -> dict:
-        return self._generate(**kwargs)
+        prompts = kwargs.get("prompts", [{"text": "a beautiful sunset", "weight": 1.0}])
+        prompt_text = prompts[0]["text"] if prompts else "a beautiful sunset"
+
+        prompt_changed = (
+            self._cached_prompt_text is not None
+            and prompt_text != self._cached_prompt_text
+        )
+
+        if prompt_changed and self._last_output is not None and not self._prompt_interrupted:
+            # First call after prompt change: replay last chunk instantly
+            # while the caller keeps driving the loop.  The next call will
+            # fall through to _generate which encodes the new prompt.
+            logger.info(
+                f"Prompt changed — replaying last chunk while encoding new prompt. "
+                f"Old: '{self._cached_prompt_text[:60]}' -> New: '{prompt_text[:60]}'"
+            )
+            self._prompt_interrupted = True
+            # Invalidate prompt cache so the *next* call encodes the new prompt
+            self._cached_prompt_text = None
+            self._cached_context = None
+            return self._replay_last_output()
+
+        self._prompt_interrupted = False
+        result = self._generate(**kwargs)
+        self._cache_output(result)
+        return result
+
+    def _cache_output(self, result: dict):
+        """Cache the last successful generation output for replay."""
+        self._last_output = {
+            "video": result["video"].clone() if hasattr(result["video"], "clone") else result["video"],
+            "audio": result["audio"].clone() if hasattr(result["audio"], "clone") else result["audio"],
+            "audio_sample_rate": result["audio_sample_rate"],
+            "frame_rate": result["frame_rate"],
+        }
+
+    def _replay_last_output(self) -> dict:
+        """Return the last chunk with fresh timestamps for seamless playback."""
+        out = self._last_output
+        video_timestamps, audio_timestamps = self._advance_chunk_timestamps(
+            num_frames=out["video"].shape[0],
+            audio_samples=out["audio"].shape[-1],
+            audio_sample_rate=out["audio_sample_rate"],
+        )
+        return {
+            "video": out["video"],
+            "video_timestamps": video_timestamps,
+            "audio": out["audio"],
+            "audio_sample_rate": out["audio_sample_rate"],
+            "audio_timestamps": audio_timestamps,
+            "frame_rate": out["frame_rate"],
+        }
 
     def _advance_chunk_timestamps(
         self,

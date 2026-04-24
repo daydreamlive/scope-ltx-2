@@ -261,6 +261,8 @@ class LTX2Pipeline(Pipeline):
         ffn_chunk_size: int | None = 4096,
         loras: list[dict] | None = None,
         realtime_pacing_slack: float = 0.0,
+        text_encoder_quant: str = "int4",
+        transformer_quant: str = "fp8",
         **kwargs,
     ):
         from .model_loader import load_transformer
@@ -290,6 +292,8 @@ class LTX2Pipeline(Pipeline):
         self.sigmas = sigmas if sigmas is not None else make_sigma_schedule(num_steps, schedule)
         self.ffn_chunk_size = ffn_chunk_size
         self.realtime_pacing_slack = realtime_pacing_slack
+        self.text_encoder_quant = text_encoder_quant
+        self.transformer_quant = transformer_quant
 
         if kwargs:
             logger.debug(f"LTX2Pipeline ignoring unknown kwargs: {list(kwargs.keys())}")
@@ -366,7 +370,11 @@ class LTX2Pipeline(Pipeline):
                 try:
                     gemma_sd = fut_gemma_sd.result()
                     enc, tok = load_gemma_text_encoder(
-                        gemma_model_path, device=gemma_device, dtype=dtype, preloaded_sd=gemma_sd
+                        gemma_model_path,
+                        device=gemma_device,
+                        dtype=dtype,
+                        preloaded_sd=gemma_sd,
+                        quantize=text_encoder_quant if text_encoder_quant != "fp8" else None,
                     )
                     gemma_result["encoder"] = enc
                     gemma_result["tokenizer"] = tok
@@ -385,13 +393,16 @@ class LTX2Pipeline(Pipeline):
 
             # Step 3: Load transformer to CPU.  This runs while the Gemma
             # background thread is still transferring FP8 weights to GPU.
-            logger.info("Loading transformer (FP8, CPU-resident)...")
+            logger.info(
+                f"Loading transformer ({'int4 (post-quant)' if transformer_quant == 'int4' else 'FP8'}, CPU-resident)..."
+            )
             self._transformer = load_transformer(
                 transformer_path,
                 device=torch.device("cpu"),
                 dtype=dtype,
                 preloaded_sd=fut_transformer_sd.result(),
                 preloaded_metadata=fut_transformer_meta.result(),
+                quantize=transformer_quant if transformer_quant != "fp8" else None,
             )
 
             # Step 3b: Merge user LoRA weights (before FFN chunking / streaming setup)
@@ -417,8 +428,10 @@ class LTX2Pipeline(Pipeline):
                 self._pending_id_lora = None
             self._id_lora_merged = False
 
-            if ffn_chunk_size is not None:
-                self._apply_ffn_chunking(ffn_chunk_size)
+            # FFN chunking must be applied AFTER any int4 re-quantization,
+            # since _ChunkedFFN renames module paths and would break the
+            # weight-scale lookup used during FP8 → bf16 dequantization.
+            # The chunking happens below once quantization (if any) finishes.
 
             _log_gpu_memory("transformer loaded (CPU)")
 
@@ -445,6 +458,36 @@ class LTX2Pipeline(Pipeline):
             self._tokenizer = gemma_result["tokenizer"]
             self._text_encoder_on_gpu = True
             _log_gpu_memory("gemma loaded")
+
+            # Optional: move the whole transformer to GPU and quantize the
+            # block Linears to int4 via torchao.  Done per-block to avoid
+            # ever holding the full bf16 transformer (~39 GB) on GPU.  The
+            # helper keeps the FP8 weights in place until each block lands
+            # on GPU, then dequantizes to bf16 and immediately re-packs to
+            # int4 before moving on.  Pairs best with text_encoder_quant=int4
+            # so the final co-resident footprint is ~17 GB.
+            if transformer_quant == "int4" and device.type == "cuda":
+                from .model_loader import quantize_transformer_int4
+                logger.info("Per-block int4 quantization of transformer on GPU...")
+                t0 = time.time()
+                quantize_transformer_int4(self._transformer, device, dtype)
+                gc.collect()
+                torch.cuda.empty_cache()
+                logger.info(
+                    f"Transformer int4 quantization done in {time.time()-t0:.1f}s"
+                )
+                _log_gpu_memory("transformer int4 on GPU")
+                # Skip block streaming entirely — everything is already
+                # co-resident on GPU, no offload needed for VAE decode.
+                self._transformer_int4_resident = True
+            else:
+                self._transformer_int4_resident = False
+
+            # FFN chunking is applied last, so any int4 quantization above
+            # sees the original (unwrapped) module paths and can look up
+            # the FP8 weight scales correctly.
+            if ffn_chunk_size is not None:
+                self._apply_ffn_chunking(ffn_chunk_size)
         finally:
             _prefetch_pool.shutdown(wait=False)
         logger.info(f"Prefetched safetensors state dicts in parallel ({time.time()-prefetch_t0:.1f}s)")
@@ -604,7 +647,19 @@ class LTX2Pipeline(Pipeline):
             if hasattr(block, 'audio_ff') and isinstance(block.audio_ff, _ChunkedFFN):
                 block.audio_ff = block.audio_ff.ff
 
+    def _is_co_resident_mode(self) -> bool:
+        """Whether Gemma + transformer + VAE are kept co-resident on GPU.
+
+        In co-resident mode (``text_encoder_quant != "fp8"``) the quantized
+        text encoder is small enough that the Gemma/transformer swap isn't
+        needed — eliminating the ~70 GB CPU↔GPU traffic that a prompt change
+        would otherwise trigger.
+        """
+        return getattr(self, "text_encoder_quant", "fp8") != "fp8"
+
     def _offload_text_encoder(self):
+        if self._is_co_resident_mode():
+            return
         if not self._text_encoder_on_gpu:
             return
         logger.info("Offloading Gemma to CPU...")
@@ -925,6 +980,24 @@ class LTX2Pipeline(Pipeline):
         if self._streaming_state is not None:
             return
 
+        # int4 mode: the entire transformer is already fully resident on GPU
+        # after __init__ (scaffold + blocks at int4). No streaming needed.
+        # We still allocate a BlockStreamingState record so the rest of the
+        # plumbing (decode pause, bookkeeping) keeps working, but mark every
+        # block as permanently resident.
+        if getattr(self, "_transformer_int4_resident", False):
+            from scope_ltx_2.weight_streaming import (
+                BlockStreamingConfig, BlockStreamingState,
+            )
+            blocks = self._transformer.transformer_blocks
+            config = BlockStreamingConfig(blocks_to_stream=0, compute_device=self.device)
+            state = BlockStreamingState(blocks, config)
+            state.block_on_gpu = [True] * state.num_blocks
+            state.streaming_start_idx = state.num_blocks  # disables offload
+            self._streaming_state = state
+            _log_gpu_memory("transformer int4 resident, streaming disabled")
+            return
+
         self._move_transformer_scaffold_to_gpu()
         _log_gpu_memory("transformer scaffold on GPU")
 
@@ -1019,9 +1092,12 @@ class LTX2Pipeline(Pipeline):
             # re-anchor at its end.
             self._wall_clock_start = None
 
-            # Gemma needs ~13 GB — free everything else first
-            self._teardown_denoising()
-            self._offload_vaes()
+            # In FP8 mode, Gemma needs ~13 GB on GPU — free everything else
+            # first.  In int4 mode (co-resident), Gemma only uses ~7.5 GB and
+            # stays resident, so we skip the teardown/offload dance entirely.
+            if not self._is_co_resident_mode():
+                self._teardown_denoising()
+                self._offload_vaes()
 
             self._load_text_encoder()
 
@@ -1373,6 +1449,8 @@ class LTX2Pipeline(Pipeline):
         """
         if self._streaming_state is None:
             return
+        if getattr(self, "_transformer_int4_resident", False):
+            return
         state = self._streaming_state
         device = state.config.compute_device
         reloaded = 0
@@ -1401,6 +1479,10 @@ class LTX2Pipeline(Pipeline):
         _reload_resident_blocks() loads them back before the next denoising pass.
         """
         if self._streaming_state is None:
+            return
+        if getattr(self, "_transformer_int4_resident", False):
+            # int4 transformer is small enough to stay on GPU during VAE
+            # decode — skip the CPU swap entirely.
             return
         state = self._streaming_state
         offloaded = 0

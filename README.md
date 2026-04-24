@@ -29,6 +29,31 @@ LTX 2.3 is a 22B-parameter DiT (Diffusion Transformer) that generates synchroniz
 - **Python**: 3.12+
 - **CUDA**: 12.8+
 
+### 32GB GPU (RTX 5090) mode
+
+With `text_encoder_quant="int4"` (load param) the Gemma checkpoint is
+re-quantized from FP8 to int4 via torchao (tinygemm, group_size=128),
+dropping its footprint from ~13 GB to ~7.5 GB.  That saves enough room
+for Gemma to stay **resident** alongside the transformer + VAE — so a
+prompt change no longer triggers the ~40 GB CPU↔GPU swap that the FP8
+flow uses to free VRAM for the text encoder.  Peak generation VRAM on a
+32GB card is ~30 GiB; prompt change goes from multi-second reloads to
+essentially free.  First-load adds ~20s of one-time FP8→bf16 dequant on
+the CPU and needs ~25 GB of system RAM briefly.  Recommended on Blackwell
+(RTX 5090 and up).
+
+```bash
+curl -X POST http://localhost:8000/load \
+  -H "Content-Type: application/json" \
+  -d '{"pipeline_id": "ltx2", "params": {"text_encoder_quant": "int4"}}'
+```
+
+The matching `transformer_quant="int4"` option is also implemented (peak
+drops to ~25 GiB with zero block-swap during VAE decode), but torchao's
+int4 tinygemm kernel is not yet tensor-core accelerated on Blackwell and
+runs the denoiser ~10× slower than the FP8 path; prefer it only when
+strict zero-swap matters more than throughput.
+
 ## Supported Models
 
 Weights are pulled from these Hugging Face repositories:

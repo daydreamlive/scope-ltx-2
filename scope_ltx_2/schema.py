@@ -309,6 +309,44 @@ class LTX2Config(BasePipelineConfig):
         ),
     )
 
+    # Text encoder quantization: lets the full pipeline (Gemma + transformer
+    # + VAE) stay co-resident on GPU without swapping to system RAM during
+    # prompt changes. Meant for 32 GB cards like the RTX 5090 where the FP8
+    # Gemma (~13 GB) + FP8 transformer (~23 GB) don't both fit.
+    text_encoder_quant: Literal["fp8", "int4"] = Field(
+        default="int4",
+        description=(
+            "Gemma text encoder quantization. 'int4' (default) dequantizes "
+            "the FP8 checkpoint to bf16 then re-packs with torchao int4 "
+            "weight-only (~7.5 GB VRAM) — Gemma stays co-resident with the "
+            "transformer, so prompt changes don't trigger the ~70 GB "
+            "CPU↔GPU swap. Costs ~20 s of one-time FP8→bf16 dequant on the "
+            "CPU at load (needs ~25 GB system RAM briefly). 'fp8' keeps "
+            "the original ~13 GB FP8 Gemma with torch._scaled_mm and the "
+            "legacy swap-on-prompt-change behaviour."
+        ),
+        json_schema_extra=ui_field_config(
+            order=16, label="Text Encoder Quant", is_load_param=True,
+        ),
+    )
+
+    transformer_quant: Literal["fp8", "int4"] = Field(
+        default="fp8",
+        description=(
+            "Transformer block quantization. 'fp8' (default) keeps the "
+            "checkpoint FP8 weights (~16 GB VRAM for blocks) and uses "
+            "torch._scaled_mm. 'int4' dequantizes to bf16 then re-packs "
+            "with torchao int4 weight-only (~5 GB VRAM for blocks), letting "
+            "the full transformer + VAE stay co-resident during VAE decode "
+            "on a 32 GB GPU — i.e. no block offload to pinned CPU memory "
+            "between chunks. Pair with text_encoder_quant='int4' for the "
+            "fully swap-free experience."
+        ),
+        json_schema_extra=ui_field_config(
+            order=17, label="Transformer Quant", is_load_param=True,
+        ),
+    )
+
     # Seed randomization
     randomize_seed: bool = Field(
         default=True,

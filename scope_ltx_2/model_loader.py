@@ -6,6 +6,7 @@ safetensors files in the Kijai/LTX2.3_comfy format.
 
 import json
 import logging
+import time
 import types
 from pathlib import Path
 
@@ -209,6 +210,7 @@ def load_transformer(
     dtype: torch.dtype = torch.bfloat16,
     preloaded_sd: dict | None = None,
     preloaded_metadata: dict | None = None,
+    quantize: str | None = None,
 ) -> LTXAVModel:
     """Load LTXAVModel from a Kijai separated transformer checkpoint.
 
@@ -218,6 +220,14 @@ def load_transformer(
 
     Weights are moved to the target device while preserving their original
     dtypes (fp8 stays fp8, bf16 stays bf16) to fit within 24GB VRAM.
+
+    When ``quantize="int4"``, the FP8 block Linear weights are dequantized
+    to bf16 in-place (using the stored per-tensor scales) and the normal
+    nn.Linear.forward is kept; later the pipeline applies torchao int4
+    weight-only quantization via :func:`quantize_transformer_int4` once the
+    model is on GPU. This shrinks the 22B blocks from ~16 GiB FP8 to
+    ~5 GiB int4 so the full pipeline fits on a 32 GB GPU without block
+    streaming or CPU offload.
     """
     checkpoint_path = Path(checkpoint_path)
     logger.info(f"Loading transformer from: {checkpoint_path}")
@@ -280,11 +290,15 @@ def load_transformer(
     # until block streaming. Avoid empty_cache() so we don't contend with a
     # concurrent Gemma GPU transfer happening on a background thread.
 
-    # Patch FP8 linear layers to use scaled matmul with proper scales
-    if fp8_scales:
+    # Patch FP8 linear layers to use scaled matmul with proper scales.
+    # Skipped in int4 mode — those blocks will be dequantized and re-packed
+    # to int4 by quantize_transformer_int4() once the model is on GPU.
+    if fp8_scales and quantize != "int4":
         patched = patch_fp8_layers(model, fp8_scales)
         logger.info(f"Patched {patched} FP8 linear layers with scaled matmul")
     model._fp8_scales = fp8_scales
+    # Keep scales even in int4 mode so the pipeline can dequantize per-block
+    # on GPU at the right moment (saves ~30 GB peak bf16 on CPU).
     del fp8_scales
 
     model.eval()
@@ -294,6 +308,117 @@ def load_transformer(
     logger.info(f"Transformer loaded on CPU: {param_count/1e9:.1f}B params, {mem_gb:.1f}GB")
 
     return model
+
+
+def quantize_transformer_int4(
+    model: nn.Module,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+    group_size: int = 128,
+) -> int:
+    """Move transformer to GPU and re-quantize block Linears to int4 in-place.
+
+    Assumes ``load_transformer(quantize="int4")`` left the FP8 block weights
+    unpatched (no ``_fp8_scaled_forward`` monkey-patch) with the per-tensor
+    weight scales stored on ``model._fp8_scales``.  Working *one block at a
+    time* avoids ever holding the full bf16 transformer (~39 GB) on either
+    CPU or GPU:
+
+      * move block to GPU (still FP8 for Linear weights)
+      * dequantize FP8 Linear weights to bf16 on GPU (per-layer, ≤500 MB)
+      * apply torchao ``Int4WeightOnlyConfig`` v1 to that block
+      * free the bf16 temporaries via empty_cache
+
+    The scaffold (adaln_single, caption_projection, embedding connectors,
+    norms, biases) is moved to GPU in bf16 at the end; scaffold Linears are
+    kept at bf16 to preserve numerical sensitivity.
+
+    Returns the number of block Linear layers quantized.
+    """
+    import gc
+    from torchao.quantization import Int4WeightOnlyConfig, quantize_
+
+    fp8_scales: dict[str, torch.Tensor] = getattr(model, "_fp8_scales", {})
+    _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # noqa: F841
+
+    def _dequant_fp8_linears_in(module: nn.Module, module_fqn: str) -> None:
+        for name, sub in module.named_modules():
+            if not isinstance(sub, nn.Linear):
+                continue
+            if sub.weight.dtype != torch.float8_e4m3fn:
+                continue
+            full_fqn = f"{module_fqn}.{name}" if name else module_fqn
+            scale_key = f"{full_fqn}.weight_scale"
+            ws = fp8_scales.get(scale_key)
+            if ws is None:
+                logger.warning(f"No weight_scale for {full_fqn}; leaving FP8")
+                continue
+            w = sub.weight.data
+            scale = ws.to(device=w.device, dtype=torch.float32)
+            sub.weight.data = (w.float() * scale).to(dtype)
+            # Strip any previous FP8 patch artifacts if present.
+            for attr in ("_fp8_input_scale", "_fp8_weight_scale"):
+                if hasattr(sub, attr):
+                    delattr(sub, attr)
+
+    block_filter = lambda m, fqn: isinstance(m, nn.Linear)  # noqa: E731
+
+    blocks = model.transformer_blocks
+    n_blocks = len(blocks)
+    quantized_linears = 0
+    t0 = time.time()
+
+    for idx, block in enumerate(blocks):
+        # 1. Move this block's tensors to GPU (preserving dtypes).
+        for p in block.parameters():
+            p.data = p.data.to(device=device, non_blocking=True)
+        for b in block.buffers():
+            b.data = b.data.to(device=device, non_blocking=True)
+        torch.cuda.synchronize(device)
+
+        # 2. Dequantize any FP8 Linear weights to bf16 on GPU.
+        _dequant_fp8_linears_in(block, f"transformer_blocks.{idx}")
+
+        # 3. Apply torchao int4 weight-only to every Linear in this block.
+        quantize_(block, Int4WeightOnlyConfig(group_size=group_size, version=1), filter_fn=block_filter)
+        quantized_linears += sum(1 for m in block.modules() if isinstance(m, nn.Linear))
+
+        # 4. Drop bf16 temporaries from the caching allocator so peak stays
+        #    bounded to roughly (current int4 blocks + 1 bf16 block).
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        if (idx + 1) % 8 == 0 or idx == n_blocks - 1:
+            torch.cuda.synchronize(device)
+            allocated = torch.cuda.memory_allocated(device) / 1024**3
+            logger.info(
+                f"Quantized block {idx+1}/{n_blocks} to int4 "
+                f"({allocated:.2f} GiB allocated)"
+            )
+
+    # Scaffold: move everything that isn't a transformer block to GPU.
+    scaffold_exclude = {"transformer_blocks"}
+    for name, child in model.named_children():
+        if name in scaffold_exclude:
+            continue
+        for p in child.parameters():
+            p.data = p.data.to(device=device, non_blocking=True)
+        for b in child.buffers():
+            b.data = b.data.to(device=device, non_blocking=True)
+    for _, p in model.named_parameters(recurse=False):
+        p.data = p.data.to(device=device, non_blocking=True)
+    for _, b in model.named_buffers(recurse=False):
+        b.data = b.data.to(device=device, non_blocking=True)
+    torch.cuda.synchronize(device)
+
+    # Drop the stored FP8 scales — they're no longer needed after int4 quant.
+    model._fp8_scales = {}
+
+    logger.info(
+        f"Transformer int4: {quantized_linears} block Linears quantized, "
+        f"scaffold moved to GPU in bf16 ({time.time()-t0:.1f}s)"
+    )
+    return quantized_linears
 
 
 def load_vae(

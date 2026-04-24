@@ -84,6 +84,7 @@ def load_gemma_text_encoder(
     gemma_model_path: str | Path,
     device: torch.device = torch.device("cuda"),
     dtype: torch.dtype = torch.bfloat16,
+    preloaded_sd: dict | None = None,
 ):
     """Load Gemma 3 12B text encoder, optionally with FP8 weights.
 
@@ -115,7 +116,7 @@ def load_gemma_text_encoder(
         with torch.device("meta"):
             model = Gemma3ForCausalLM(text_config)
 
-        fp8_sd = load_file(str(gemma_model_path), device="cpu")
+        fp8_sd = preloaded_sd if preloaded_sd is not None else load_file(str(gemma_model_path), device="cpu")
 
         tokenizer = _extract_tokenizer_from_safetensors(fp8_sd)
 
@@ -134,7 +135,7 @@ def load_gemma_text_encoder(
                 pass
             else:
                 model_weights[k] = v
-        del fp8_sd
+        fp8_sd.clear()
 
         logger.info(f"Separated {len(fp8_scales)} FP8 scale keys, skipped {n_skipped} vision/multi_modal keys")
 
@@ -177,11 +178,17 @@ def load_gemma_text_encoder(
             logger.info(f"Patched {patched} Gemma FP8 linear layers with scaled matmul")
         del fp8_scales
 
-        # Move to device preserving dtypes (FP8 stays FP8)
+        # Move to device preserving dtypes (FP8 stays FP8).  non_blocking=True
+        # lets CUDA batch the per-tensor host→device copies rather than
+        # synchronising on every call; this roughly halves the transfer time
+        # even for non-pinned (mmap'd) source memory.  A single synchronize
+        # at the end ensures all copies complete before the model is used.
         for param in model.parameters():
-            param.data = param.data.to(device=device)
+            param.data = param.data.to(device=device, non_blocking=True)
         for name, buf in model.named_buffers():
-            buf.data = buf.data.to(device=device)
+            buf.data = buf.data.to(device=device, non_blocking=True)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
     else:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -254,8 +261,12 @@ class TextEmbeddingProjection(nn.Module):
         cls,
         checkpoint_path: str | Path,
         dtype: torch.dtype = torch.bfloat16,
+        preloaded_sd: dict[str, torch.Tensor] | None = None,
     ) -> "TextEmbeddingProjection":
-        sd = load_file(str(checkpoint_path), device="cpu")
+        # Use mmap-backed loader so tensors are adopted via assign=True
+        # (avoids kaiming_uniform init of 770M-param Linear that would just
+        # be overwritten).
+        sd = preloaded_sd if preloaded_sd is not None else load_file(str(checkpoint_path), device="cpu")
 
         prefix = "text_embedding_projection."
 
@@ -267,13 +278,19 @@ class TextEmbeddingProjection(nn.Module):
             weight = sd[w_key]
             out_features, in_features = weight.shape
             has_bias = b_key in sd
-            linear = nn.Linear(in_features, out_features, bias=has_bias)
-            sub_sd = {}
-            for k, v in sd.items():
-                if k.startswith(f"{prefix}{name}."):
-                    sub_sd[k.removeprefix(f"{prefix}{name}.")] = v
-            linear.load_state_dict(sub_sd)
-            return linear.to(dtype=dtype)
+            # Construct on meta device to skip weight init, then assign loaded
+            # tensors directly. The checkpoint is already bf16 so no cast needed.
+            with torch.device("meta"):
+                linear = nn.Linear(in_features, out_features, bias=has_bias)
+            sub_sd = {
+                k.removeprefix(f"{prefix}{name}."): v
+                for k, v in sd.items()
+                if k.startswith(f"{prefix}{name}.")
+            }
+            linear.load_state_dict(sub_sd, assign=True)
+            if linear.weight.dtype != dtype:
+                linear = linear.to(dtype=dtype)
+            return linear
 
         video_agg = _load_linear("video_aggregate_embed")
         audio_agg = _load_linear("audio_aggregate_embed")

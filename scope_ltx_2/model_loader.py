@@ -207,6 +207,8 @@ def load_transformer(
     checkpoint_path: str | Path,
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.bfloat16,
+    preloaded_sd: dict | None = None,
+    preloaded_metadata: dict | None = None,
 ) -> LTXAVModel:
     """Load LTXAVModel from a Kijai separated transformer checkpoint.
 
@@ -220,15 +222,21 @@ def load_transformer(
     checkpoint_path = Path(checkpoint_path)
     logger.info(f"Loading transformer from: {checkpoint_path}")
 
-    metadata = None
-    try:
-        from safetensors import safe_open
-        with safe_open(str(checkpoint_path), framework="pt") as f:
-            metadata = f.metadata()
-    except Exception:
-        pass
+    if preloaded_metadata is not None:
+        metadata = preloaded_metadata
+    else:
+        metadata = None
+        try:
+            from safetensors import safe_open
+            with safe_open(str(checkpoint_path), framework="pt") as f:
+                metadata = f.metadata()
+        except Exception:
+            pass
 
-    state_dict = load_file(str(checkpoint_path), device="cpu")
+    if preloaded_sd is not None:
+        state_dict = preloaded_sd
+    else:
+        state_dict = load_file(str(checkpoint_path), device="cpu")
 
     # Kijai checkpoints use "model.diffusion_model." prefix — strip it
     prefix = "model.diffusion_model."
@@ -268,7 +276,9 @@ def load_transformer(
         logger.warning(f"Unexpected keys ({len(unexpected)}): {unexpected[:10]}...")
 
     del model_weights
-    torch.cuda.empty_cache()
+    # No GPU allocations happened here — the transformer stays CPU-resident
+    # until block streaming. Avoid empty_cache() so we don't contend with a
+    # concurrent Gemma GPU transfer happening on a background thread.
 
     # Patch FP8 linear layers to use scaled matmul with proper scales
     if fp8_scales:

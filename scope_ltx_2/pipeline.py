@@ -428,6 +428,24 @@ class LTX2Pipeline(Pipeline):
                 self._pending_id_lora = None
             self._id_lora_merged = False
 
+            # Under transformer_quant=int4 the deferred merge path can't run:
+            # by the time audio_mode="id_lora" is first used, the transformer
+            # is torchao-int4 packed (tensor-subclass storage) and lora.py's
+            # in-place writes to ``module.weight.data`` would fail or silently
+            # break.  Merge it eagerly now while the weights are still FP8.
+            if transformer_quant == "int4" and self._pending_id_lora is not None:
+                from .lora import load_and_merge_loras
+                logger.info(
+                    "Eager-merging ID-LoRA before int4 quant (deferred merge "
+                    "is incompatible with transformer_quant=int4)"
+                )
+                merged = load_and_merge_loras(
+                    self._transformer, [self._pending_id_lora],
+                )
+                self.loaded_lora_adapters.extend(merged)
+                self._pending_id_lora = None
+                self._id_lora_merged = True
+
             # FFN chunking must be applied AFTER any int4 re-quantization,
             # since _ChunkedFFN renames module paths and would break the
             # weight-scale lookup used during FP8 → bf16 dequantization.

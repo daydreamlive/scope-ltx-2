@@ -72,21 +72,18 @@ def _fp8_scaled_forward(
     return out
 
 
-def patch_fp8_layers(model: nn.Module, fp8_scales: dict[str, torch.Tensor]) -> int:
-    """Patch all linear layers with FP8 weights to use scaled matmul.
+def attach_fp8_scales(model: nn.Module, fp8_scales: dict[str, torch.Tensor]) -> int:
+    """Attach FP8 per-tensor scales as module attributes (no forward override).
 
-    Finds every nn.Linear whose weight is float8_e4m3fn, looks up the
-    corresponding input_scale and weight_scale from fp8_scales, and
-    monkey-patches the forward method to use torch._scaled_mm.
-
-    If input_scale is absent (e.g. Comfy-Org Gemma FP8 checkpoints),
-    defaults to 1.0 — matching ComfyUI's fp8_linear which clamps input
-    to FP8 range and casts directly without prescaling.
-
-    Returns the number of layers patched.
+    LoRA merge (``lora.py``) and the per-block int4 re-quant
+    (``quantize_transformer_int4``) both look up the per-tensor weight scale
+    via ``module._fp8_weight_scale``.  Keeping that lookup module-local — and
+    letting LoRA merge update it in place — means we don't have to thread the
+    ``model._fp8_scales`` dict through both paths or worry about it going
+    stale after a merge.
     """
     _default_input_scale = torch.tensor(1.0, dtype=torch.float32)
-    patched = 0
+    attached = 0
     skipped = 0
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
@@ -96,19 +93,40 @@ def patch_fp8_layers(model: nn.Module, fp8_scales: dict[str, torch.Tensor]) -> i
 
         ws_key = f"{name}.weight_scale"
         if ws_key not in fp8_scales:
-            logger.warning(f"FP8 layer {name} missing weight_scale, skipping patch")
+            logger.warning(f"FP8 layer {name} missing weight_scale, skipping")
             skipped += 1
             continue
 
         is_key = f"{name}.input_scale"
         module._fp8_input_scale = fp8_scales.get(is_key, _default_input_scale)
         module._fp8_weight_scale = fp8_scales[ws_key]
-
-        module.forward = types.MethodType(_fp8_scaled_forward, module)
-        patched += 1
+        attached += 1
 
     if skipped:
         logger.warning(f"{skipped} FP8 layers skipped (missing weight_scale)")
+    return attached
+
+
+def patch_fp8_layers(model: nn.Module, fp8_scales: dict[str, torch.Tensor]) -> int:
+    """Attach FP8 scales and override forward to use ``torch._scaled_mm``.
+
+    If input_scale is absent (e.g. Comfy-Org Gemma FP8 checkpoints),
+    defaults to 1.0 — matching ComfyUI's fp8_linear which clamps input
+    to FP8 range and casts directly without prescaling.
+
+    Returns the number of layers patched.
+    """
+    attach_fp8_scales(model, fp8_scales)
+    patched = 0
+    for _name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if module.weight.dtype != torch.float8_e4m3fn:
+            continue
+        if not hasattr(module, "_fp8_weight_scale"):
+            continue
+        module.forward = types.MethodType(_fp8_scaled_forward, module)
+        patched += 1
     return patched
 
 
@@ -290,15 +308,20 @@ def load_transformer(
     # until block streaming. Avoid empty_cache() so we don't contend with a
     # concurrent Gemma GPU transfer happening on a background thread.
 
-    # Patch FP8 linear layers to use scaled matmul with proper scales.
-    # Skipped in int4 mode — those blocks will be dequantized and re-packed
-    # to int4 by quantize_transformer_int4() once the model is on GPU.
-    if fp8_scales and quantize != "int4":
-        patched = patch_fp8_layers(model, fp8_scales)
-        logger.info(f"Patched {patched} FP8 linear layers with scaled matmul")
+    # Attach FP8 per-tensor scales as module attributes in both modes — LoRA
+    # merge needs to find them on the module to dequantize/re-quantize
+    # correctly, and quantize_transformer_int4 reads them off the module so
+    # post-LoRA scale updates propagate.  Only the forward override (scaled
+    # matmul) is gated on int4 mode — those blocks get dequantized and
+    # re-packed to int4 once they land on GPU.
+    if fp8_scales:
+        if quantize == "int4":
+            attached = attach_fp8_scales(model, fp8_scales)
+            logger.info(f"Attached FP8 scales to {attached} linear layers (int4 mode)")
+        else:
+            patched = patch_fp8_layers(model, fp8_scales)
+            logger.info(f"Patched {patched} FP8 linear layers with scaled matmul")
     model._fp8_scales = fp8_scales
-    # Keep scales even in int4 mode so the pipeline can dequantize per-block
-    # on GPU at the right moment (saves ~30 GB peak bf16 on CPU).
     del fp8_scales
 
     model.eval()
@@ -347,10 +370,17 @@ def quantize_transformer_int4(
                 continue
             if sub.weight.dtype != torch.float8_e4m3fn:
                 continue
-            full_fqn = f"{module_fqn}.{name}" if name else module_fqn
-            scale_key = f"{full_fqn}.weight_scale"
-            ws = fp8_scales.get(scale_key)
+            # Prefer the module-local scale: LoRA merge updates it in place
+            # after merging weights, so reading from model._fp8_scales would
+            # be stale.  Fall back to the model-level dict if attach_fp8_scales
+            # didn't run (shouldn't happen in practice).
+            ws = getattr(sub, "_fp8_weight_scale", None)
             if ws is None:
+                full_fqn = f"{module_fqn}.{name}" if name else module_fqn
+                scale_key = f"{full_fqn}.weight_scale"
+                ws = fp8_scales.get(scale_key)
+            if ws is None:
+                full_fqn = f"{module_fqn}.{name}" if name else module_fqn
                 logger.warning(f"No weight_scale for {full_fqn}; leaving FP8")
                 continue
             w = sub.weight.data

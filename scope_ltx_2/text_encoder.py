@@ -11,6 +11,7 @@ Implements the V2 text embedding pipeline:
 import logging
 import math
 import tempfile
+import time
 from pathlib import Path
 
 import torch
@@ -80,11 +81,66 @@ def _extract_tokenizer_from_safetensors(fp8_sd: dict[str, torch.Tensor]) -> "Gem
     return tokenizer
 
 
+def _dequantize_fp8_state_dict(
+    model_weights: dict[str, torch.Tensor],
+    fp8_scales: dict[str, torch.Tensor],
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """Dequantize FP8 Linear weights to ``dtype`` using per-tensor weight scales.
+
+    Leaves non-FP8 weights untouched.  The returned dict replaces each FP8
+    weight with ``weight.float() * weight_scale`` cast to ``dtype``.  Used
+    when we want to re-quantize Gemma to int4 via torchao rather than
+    running FP8 scaled matmul at inference.
+    """
+    out: dict[str, torch.Tensor] = {}
+    for k, v in model_weights.items():
+        if v.dtype == torch.float8_e4m3fn:
+            ws = fp8_scales.get(f"{k}_scale")  # e.g. ".weight" -> ".weight_scale"
+            if ws is None:
+                logger.warning(f"No weight_scale for FP8 tensor {k}; keeping FP8")
+                out[k] = v
+                continue
+            out[k] = (v.float() * ws.float()).to(dtype)
+        else:
+            out[k] = v.to(dtype) if v.dtype not in (dtype, torch.float32) else v
+    return out
+
+
+def _quantize_model_int4(
+    model: nn.Module,
+    exclude_fqns: tuple[str, ...] = ("embed_tokens", "lm_head"),
+    group_size: int = 128,
+) -> None:
+    """Apply torchao int4 weight-only quantization to the model's Linear layers.
+
+    Uses the v1 (TensorCoreTiledLayout / tinygemm) path so no fbgemm-gpu-genai
+    dependency is required — the kernel ships with PyTorch itself.  Module
+    names matching any ``exclude_fqns`` substring are skipped (typically the
+    shared input embeddings and lm_head, which int4 would degrade).
+    """
+    from torchao.quantization import Int4WeightOnlyConfig, quantize_
+
+    def filter_fn(module: nn.Module, fqn: str) -> bool:
+        if not isinstance(module, nn.Linear):
+            return False
+        if any(ex in fqn for ex in exclude_fqns):
+            return False
+        return True
+
+    quantize_(
+        model,
+        Int4WeightOnlyConfig(group_size=group_size, version=1),
+        filter_fn=filter_fn,
+    )
+
+
 def load_gemma_text_encoder(
     gemma_model_path: str | Path,
     device: torch.device = torch.device("cuda"),
     dtype: torch.dtype = torch.bfloat16,
     preloaded_sd: dict | None = None,
+    quantize: str | None = None,
 ):
     """Load Gemma 3 12B text encoder, optionally with FP8 weights.
 
@@ -100,6 +156,12 @@ def load_gemma_text_encoder(
         gemma_model_path: Path to FP8 .safetensors file OR model directory
         device: Target device
         dtype: Compute dtype for non-quantized layers
+        quantize: Optional re-quantization target.  ``None`` (default) keeps
+            the FP8 checkpoint weights and uses torch._scaled_mm.  ``"int4"``
+            dequantizes FP8 to bf16 and re-quantizes with torchao int4
+            weight-only (tinygemm), shrinking Gemma from ~13 GiB to ~7.5 GiB
+            on GPU so it can stay co-resident with the transformer without
+            swapping.
 
     Returns (model, tokenizer).
     """
@@ -138,6 +200,11 @@ def load_gemma_text_encoder(
         fp8_sd.clear()
 
         logger.info(f"Separated {len(fp8_scales)} FP8 scale keys, skipped {n_skipped} vision/multi_modal keys")
+
+        if quantize == "int4":
+            logger.info("Dequantizing FP8 Gemma -> bf16 on CPU for int4 re-quantization...")
+            model_weights = _dequantize_fp8_state_dict(model_weights, fp8_scales, dtype)
+            fp8_scales = {}
 
         missing, unexpected = model.load_state_dict(model_weights, strict=False, assign=True)
         del model_weights
@@ -189,6 +256,16 @@ def load_gemma_text_encoder(
             buf.data = buf.data.to(device=device, non_blocking=True)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
+
+        if quantize == "int4" and device.type == "cuda":
+            logger.info("Quantizing Gemma to int4 (tinygemm, group_size=128)...")
+            t0 = time.time()
+            _quantize_model_int4(model)
+            torch.cuda.synchronize(device)
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()
+            logger.info(f"Gemma int4 quantization done in {time.time()-t0:.1f}s")
 
     else:
         from transformers import AutoModelForCausalLM, AutoTokenizer

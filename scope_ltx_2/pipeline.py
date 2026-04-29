@@ -803,6 +803,8 @@ class LTX2Pipeline(Pipeline):
         wall_elapsed = now - self._wall_clock_start
         if media_elapsed > wall_elapsed * (1.0 + slack):
             time.sleep(media_elapsed - wall_elapsed)
+            self._wall_clock_start = time.monotonic()
+            self._media_ticks_at_anchor = self._media_ticks
 
     def _ensure_denoising_ready(self, total_tokens: int = 0):
         """Ensure scaffold and block streaming are set up on GPU.

@@ -424,15 +424,16 @@ class LTX2Pipeline(Pipeline):
         except Exception as e:
             logger.warning(f"Block streaming cleanup error during unload: {e}")
 
-        try:
-            self._move_transformer_scaffold_to_cpu()
-        except Exception as e:
-            logger.warning(f"Scaffold offload error during unload: {e}")
+        if hasattr(self, "_transformer"):
+            try:
+                self._move_transformer_scaffold_to_cpu()
+            except Exception as e:
+                logger.warning(f"Scaffold offload error during unload: {e}")
 
-        try:
-            self._move_connectors_to_cpu()
-        except Exception as e:
-            logger.warning(f"Connector offload error during unload: {e}")
+            try:
+                self._move_connectors_to_cpu()
+            except Exception as e:
+                logger.warning(f"Connector offload error during unload: {e}")
 
         try:
             if getattr(self, '_text_encoder_on_gpu', False):
@@ -1070,6 +1071,11 @@ class LTX2Pipeline(Pipeline):
             logger.info(
                 f"ID-LoRA reference audio latents: {ref_audio.shape} "
                 f"(identity_guidance_scale={id_guidance_scale})"
+            )
+        elif audio_mode == "id_lora":
+            logger.warning(
+                "ID-LoRA mode requested without reference audio; "
+                "generating without ID-LoRA conditioning"
             )
 
         audio_latents = torch.randn(

@@ -25,6 +25,36 @@ logger = logging.getLogger(__name__)
 _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 
+def _supports_scaled_mm() -> bool:
+    """Return True if the current CUDA device supports torch._scaled_mm.
+
+    torch._scaled_mm requires CUDA compute capability >= 8.9 (Ada, e.g. RTX 40xx)
+    or >= 9.0 (Hopper). Ampere (8.6 — RTX 30xx) does not support the native FP8
+    instructions and must fall back to a dequantized matmul path.
+    """
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return (major, minor) >= (8, 9) or major >= 9
+
+
+def _fp8_dequant_forward(
+    self: nn.Linear,
+    input: torch.Tensor,
+) -> torch.Tensor:
+    """Fallback forward for GPUs without native FP8 support (e.g. Ampere sm_86).
+
+    Dequantizes the FP8 weight to the input dtype at call time (weight * weight_scale)
+    and performs a standard bf16/fp16 matmul. This costs a per-call dequant but
+    keeps the stored weights in FP8 so VRAM usage matches the FP8 checkpoint.
+    The input is NOT quantized to FP8 — input_scale is unused in this path.
+    """
+    weight_scale: torch.Tensor = self._fp8_weight_scale
+    weight_scale = weight_scale.to(input.device, dtype=input.dtype, non_blocking=True)
+    weight = self.weight.data.to(input.dtype) * weight_scale
+    return torch.nn.functional.linear(input, weight, self.bias)
+
+
 def _fp8_scaled_forward(
     self: nn.Linear,
     input: torch.Tensor,
@@ -85,6 +115,19 @@ def patch_fp8_layers(model: nn.Module, fp8_scales: dict[str, torch.Tensor]) -> i
     Returns the number of layers patched.
     """
     _default_input_scale = torch.tensor(1.0, dtype=torch.float32)
+    use_scaled_mm = _supports_scaled_mm()
+    if not use_scaled_mm:
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            logger.warning(
+                f"CUDA device has compute capability {major}.{minor}; "
+                "torch._scaled_mm requires >= 8.9 (Ada) or >= 9.0 (Hopper). "
+                "Falling back to dequantized FP8 matmul (slower but functional)."
+            )
+        else:
+            logger.warning("CUDA unavailable; using dequantized FP8 matmul fallback.")
+    forward_impl = _fp8_scaled_forward if use_scaled_mm else _fp8_dequant_forward
+
     patched = 0
     skipped = 0
     for name, module in model.named_modules():
@@ -103,7 +146,7 @@ def patch_fp8_layers(model: nn.Module, fp8_scales: dict[str, torch.Tensor]) -> i
         module._fp8_input_scale = fp8_scales.get(is_key, _default_input_scale)
         module._fp8_weight_scale = fp8_scales[ws_key]
 
-        module.forward = types.MethodType(_fp8_scaled_forward, module)
+        module.forward = types.MethodType(forward_impl, module)
         patched += 1
 
     if skipped:

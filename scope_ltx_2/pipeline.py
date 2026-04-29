@@ -322,59 +322,132 @@ class LTX2Pipeline(Pipeline):
         logger.info(f"Text projection: {text_projection_path}")
         logger.info(f"Gemma: {gemma_model_path}")
 
-        # Step 1: Load Gemma on GPU (FP8 ~13GB)
-        gemma_device = device if Path(gemma_model_path).suffix == ".safetensors" else torch.device("cpu")
-        logger.info(f"Loading Gemma 3 12B on {gemma_device}...")
-        self._text_encoder, self._tokenizer = load_gemma_text_encoder(
-            gemma_model_path, device=gemma_device, dtype=dtype
-        )
-        self._text_encoder_on_gpu = True
-        _log_gpu_memory("gemma loaded")
+        # Phase A: Kick off parallel safetensors reads on a small thread pool.
+        # safetensors.load_file uses mmap + releases the GIL during the kernel
+        # copy, so concurrent reads overlap disk I/O + page fault handling.
+        # On cold caches (e.g. first load on a cloud VM with NVMe) this can
+        # cut wall-clock load time substantially; with a warm page cache it
+        # is close to free.
+        from concurrent.futures import ThreadPoolExecutor
+        from safetensors import safe_open as _safe_open
+        from safetensors.torch import load_file as _load_file
 
-        # Step 2: Load text projection on CPU
-        logger.info("Loading text projection (aggregate embeds)...")
-        self._text_projection = TextEmbeddingProjection.from_checkpoint(
-            text_projection_path, dtype=dtype
-        )
+        def _read_sd(path: str) -> dict:
+            return _load_file(str(path), device="cpu")
 
-        # Step 3: Load transformer to CPU
-        logger.info("Loading transformer (FP8, CPU-resident)...")
-        self._transformer = load_transformer(transformer_path, device=torch.device("cpu"), dtype=dtype)
+        def _read_metadata(path: str) -> dict | None:
+            try:
+                with _safe_open(str(path), framework="pt") as f:
+                    return dict(f.metadata()) if f.metadata() else {}
+            except Exception:
+                return None
 
-        # Step 3b: Merge user LoRA weights (before FFN chunking / streaming setup)
-        if loras is None:
-            loras = []
-        if loras:
-            from .lora import load_and_merge_loras
-            self.loaded_lora_adapters = load_and_merge_loras(self._transformer, loras)
-        else:
-            self.loaded_lora_adapters = []
+        prefetch_t0 = time.time()
+        _prefetch_pool = ThreadPoolExecutor(max_workers=5)
+        try:
+            fut_gemma_sd = _prefetch_pool.submit(_read_sd, gemma_model_path)
+            fut_transformer_sd = _prefetch_pool.submit(_read_sd, transformer_path)
+            fut_transformer_meta = _prefetch_pool.submit(_read_metadata, transformer_path)
+            fut_text_proj_sd = _prefetch_pool.submit(_read_sd, text_projection_path)
+            fut_video_vae_sd = _prefetch_pool.submit(_read_sd, video_vae_path)
+            fut_audio_vae_sd = _prefetch_pool.submit(_read_sd, audio_vae_path)
 
-        # Step 3c: Detect ID-LoRA for deferred merge.
-        # ID-LoRA is merged on first use of audio_mode="id_lora".
-        ID_LORA_FILENAME = "ltx-2.3-id-lora-talkvid-3k.safetensors"
-        id_lora_path = model_dir / "loras" / ID_LORA_FILENAME
-        already_has_id_lora = any(
-            "ID-LoRA" in (cfg.get("path") or "") for cfg in loras
-        )
-        if id_lora_path.exists() and not already_has_id_lora:
-            self._pending_id_lora = {"path": str(id_lora_path), "scale": 1.0}
-            logger.info(f"ID-LoRA available (deferred): {id_lora_path}")
-        else:
-            self._pending_id_lora = None
-        self._id_lora_merged = False
+            # Step 1: Load Gemma on GPU (FP8 ~13GB) in a background thread so
+            # the ~2s CPU→GPU copy overlaps with transformer + VAE
+            # construction on the main thread.  PyTorch releases the GIL
+            # during cudaMemcpy so the background transfer runs truly in
+            # parallel with the main thread's Python work.
+            gemma_device = device if Path(gemma_model_path).suffix == ".safetensors" else torch.device("cpu")
+            logger.info(f"Loading Gemma 3 12B on {gemma_device}...")
 
-        if ffn_chunk_size is not None:
-            self._apply_ffn_chunking(ffn_chunk_size)
+            gemma_result: dict = {}
 
-        _log_gpu_memory("transformer loaded (CPU)")
+            def _gemma_load_bg() -> None:
+                try:
+                    gemma_sd = fut_gemma_sd.result()
+                    enc, tok = load_gemma_text_encoder(
+                        gemma_model_path, device=gemma_device, dtype=dtype, preloaded_sd=gemma_sd
+                    )
+                    gemma_result["encoder"] = enc
+                    gemma_result["tokenizer"] = tok
+                except BaseException as e:
+                    gemma_result["error"] = e
 
-        # Step 4: Load VAEs to CPU
-        logger.info("Loading video VAE...")
-        self._video_vae = self._load_video_vae(video_vae_path, dtype)
+            import threading
+            _gemma_thread = threading.Thread(target=_gemma_load_bg, name="gemma-loader", daemon=True)
+            _gemma_thread.start()
 
-        logger.info("Loading audio VAE...")
-        self._audio_vae, self._vocoder = self._load_audio_vae(audio_vae_path, dtype)
+            # Step 2: Load text projection on CPU (uses meta-init + assign)
+            logger.info("Loading text projection (aggregate embeds)...")
+            self._text_projection = TextEmbeddingProjection.from_checkpoint(
+                text_projection_path, dtype=dtype, preloaded_sd=fut_text_proj_sd.result()
+            )
+
+            # Step 3: Load transformer to CPU.  This runs while the Gemma
+            # background thread is still transferring FP8 weights to GPU.
+            logger.info("Loading transformer (FP8, CPU-resident)...")
+            self._transformer = load_transformer(
+                transformer_path,
+                device=torch.device("cpu"),
+                dtype=dtype,
+                preloaded_sd=fut_transformer_sd.result(),
+                preloaded_metadata=fut_transformer_meta.result(),
+            )
+
+            # Step 3b: Merge user LoRA weights (before FFN chunking / streaming setup)
+            if loras is None:
+                loras = []
+            if loras:
+                from .lora import load_and_merge_loras
+                self.loaded_lora_adapters = load_and_merge_loras(self._transformer, loras)
+            else:
+                self.loaded_lora_adapters = []
+
+            # Step 3c: Detect ID-LoRA for deferred merge.
+            # ID-LoRA is merged on first use of audio_mode="id_lora".
+            ID_LORA_FILENAME = "ltx-2.3-id-lora-talkvid-3k.safetensors"
+            id_lora_path = model_dir / "loras" / ID_LORA_FILENAME
+            already_has_id_lora = any(
+                "ID-LoRA" in (cfg.get("path") or "") for cfg in loras
+            )
+            if id_lora_path.exists() and not already_has_id_lora:
+                self._pending_id_lora = {"path": str(id_lora_path), "scale": 1.0}
+                logger.info(f"ID-LoRA available (deferred): {id_lora_path}")
+            else:
+                self._pending_id_lora = None
+            self._id_lora_merged = False
+
+            if ffn_chunk_size is not None:
+                self._apply_ffn_chunking(ffn_chunk_size)
+
+            _log_gpu_memory("transformer loaded (CPU)")
+
+            # Step 4: Load VAEs to CPU (state dicts already prefetched).
+            # All VAE construction happens on CPU, overlapping with the Gemma
+            # GPU transfer running in the background thread.
+            logger.info("Loading video VAE...")
+            self._video_vae = self._load_video_vae(
+                video_vae_path, dtype, preloaded_sd=fut_video_vae_sd.result()
+            )
+
+            logger.info("Loading audio VAE...")
+            self._audio_vae, self._vocoder = self._load_audio_vae(
+                audio_vae_path, dtype, preloaded_sd=fut_audio_vae_sd.result()
+            )
+
+            # Finally, join the Gemma loader thread.  By now its CUDA
+            # memcpys are likely complete — the CPU work above ran
+            # concurrently with them.
+            _gemma_thread.join()
+            if "error" in gemma_result:
+                raise gemma_result["error"]
+            self._text_encoder = gemma_result["encoder"]
+            self._tokenizer = gemma_result["tokenizer"]
+            self._text_encoder_on_gpu = True
+            _log_gpu_memory("gemma loaded")
+        finally:
+            _prefetch_pool.shutdown(wait=False)
+        logger.info(f"Prefetched safetensors state dicts in parallel ({time.time()-prefetch_t0:.1f}s)")
 
         # Prompt cache
         self._cached_prompt_text = None
@@ -579,7 +652,7 @@ class LTX2Pipeline(Pipeline):
         torch.cuda.empty_cache()
         _log_gpu_memory("VAEs offloaded")
 
-    def _load_video_vae(self, checkpoint_path: str, dtype: torch.dtype):
+    def _load_video_vae(self, checkpoint_path: str, dtype: torch.dtype, preloaded_sd: dict | None = None):
         """Load video VAE using ComfyUI-compatible VideoVAE architecture.
 
         Kijai's checkpoint stores the full VAE (encoder + decoder + per_channel_statistics).
@@ -592,19 +665,36 @@ class LTX2Pipeline(Pipeline):
             full_config = json.loads(f.metadata()["config"])
 
         vae_config = full_config.get("vae", full_config)
-        vae = VideoVAE(config=vae_config)
+        # Meta-device construction avoids ~3.5s of redundant weight init for
+        # 726M params that are overwritten by load_state_dict(assign=True).
+        with torch.device("meta"):
+            vae = VideoVAE(config=vae_config)
 
-        sd = {}
-        with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                v = f.get_tensor(key)
-                sd[key] = v.to(dtype=dtype) if dtype is not None else v
+        if preloaded_sd is not None:
+            sd = {
+                k: (v.to(dtype=dtype) if dtype is not None and v.dtype != dtype else v)
+                for k, v in preloaded_sd.items()
+            }
+        else:
+            sd = {}
+            with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    v = f.get_tensor(key)
+                    sd[key] = v.to(dtype=dtype) if dtype is not None and v.dtype != dtype else v
         vae.load_state_dict(sd, strict=False, assign=True)
-        vae = vae.to(device="cpu", dtype=dtype).eval()
+        # Initialize any residual meta buffers (e.g. per_channel_statistics
+        # buffers not in checkpoint) on CPU.
+        for name, buf in list(vae.named_buffers()):
+            if buf.device.type == "meta":
+                target_dtype = buf.dtype if buf.dtype != torch.float32 else dtype
+                parent_path, _, attr = name.rpartition(".")
+                parent = vae.get_submodule(parent_path) if parent_path else vae
+                parent.register_buffer(attr, torch.zeros(buf.shape, dtype=target_dtype))
+        vae = vae.eval()
         logger.info(f"Video VAE loaded: {sum(p.numel() for p in vae.parameters())/1e6:.1f}M params")
         return vae
 
-    def _load_audio_vae(self, checkpoint_path: str, dtype: torch.dtype):
+    def _load_audio_vae(self, checkpoint_path: str, dtype: torch.dtype, preloaded_sd: dict | None = None):
         """Load audio VAE + vocoder following ComfyUI's AudioVAE pattern.
 
         Matches the loading strategy from ComfyUI's AudioVAE.__init__:
@@ -622,12 +712,31 @@ class LTX2Pipeline(Pipeline):
         with safe_open(checkpoint_path, framework="pt") as f:
             config = json.loads(f.metadata()["config"])
 
+        # Read the checkpoint once and partition keys between audio_vae and
+        # vocoder submodels. The previous implementation opened the file
+        # twice which duplicated mmap/dict setup cost.
+        if preloaded_sd is None:
+            preloaded_sd = {}
+            with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    preloaded_sd[key] = f.get_tensor(key)
+
+        audio_sd = {
+            k.removeprefix("audio_vae."): v
+            for k, v in preloaded_sd.items()
+            if k.startswith("audio_vae.")
+        }
+        vocoder_sd = {
+            k.removeprefix("vocoder."): v
+            for k, v in preloaded_sd.items()
+            if k.startswith("vocoder.")
+        }
+
         # Audio VAE — load without dtype/assign to keep float32 precision
         audio_vae_config = config.get("audio_vae", config)
         audio_vae = CausalAudioAutoencoder(config=audio_vae_config)
-        sd = _load_sd_with_prefix_replace(checkpoint_path, {"audio_vae.": ""})
-        audio_vae.load_state_dict(sd, strict=False)
-        audio_vae = audio_vae.to(device="cpu").eval()
+        audio_vae.load_state_dict(audio_sd, strict=False)
+        audio_vae = audio_vae.eval()
         logger.info(f"Audio VAE loaded: {sum(p.numel() for p in audio_vae.parameters())/1e6:.1f}M params")
 
         # Vocoder — load without dtype/assign (STFT basis and mel filterbank
@@ -637,9 +746,8 @@ class LTX2Pipeline(Pipeline):
             vocoder = VocoderWithBWE(config=vocoder_config)
         else:
             vocoder = Vocoder(config=vocoder_config)
-        sd = _load_sd_with_prefix_replace(checkpoint_path, {"vocoder.": ""})
-        vocoder.load_state_dict(sd, strict=False)
-        vocoder = vocoder.to(device="cpu").eval()
+        vocoder.load_state_dict(vocoder_sd, strict=False)
+        vocoder = vocoder.eval()
         logger.info(f"Vocoder loaded: {sum(p.numel() for p in vocoder.parameters())/1e6:.1f}M params")
 
         return audio_vae, vocoder

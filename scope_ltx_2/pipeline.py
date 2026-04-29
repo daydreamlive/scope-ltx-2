@@ -11,10 +11,9 @@ Memory Management (24GB GPU):
       CPU with double-buffered async transfers and prefetching.
     - VAEs: kept resident on GPU (~1GB total). The streaming config
       automatically accounts for their memory at setup time.
-    - Between generations: streaming state (hooks, pinned memory) persists.
-      Resident blocks are temporarily offloaded for VAE decode, then
-      reloaded by pre-forward hooks on the next denoising pass.
-    - Full teardown only when text encoder needs to reload (prompt change).
+    - Between generations and prompt changes: streaming state (hooks, pinned
+      memory) persists. Resident blocks are temporarily offloaded for VAE
+      decode or text encoding, then reloaded before the next denoising pass.
 
 Audio Support:
     LTX 2.3 natively supports synchronized audio-video generation.
@@ -453,6 +452,7 @@ class LTX2Pipeline(Pipeline):
         self._cached_prompt_text = None
         self._cached_context = None
         self._streaming_state = None
+        self._transformer_scaffold_on_gpu = False
         self._vaes_on_gpu = False
 
         # Running media-time cursor (in 90 kHz ticks) shared by video and
@@ -609,7 +609,9 @@ class LTX2Pipeline(Pipeline):
         if not self._text_encoder_on_gpu:
             return
         logger.info("Offloading Gemma to CPU...")
-        _move_module_to(self._text_encoder, "cpu")
+        _move_module_to(self._text_encoder, "cpu", non_blocking=True)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
         self._text_encoder_on_gpu = False
         gc.collect()
         torch.cuda.empty_cache()
@@ -619,7 +621,9 @@ class LTX2Pipeline(Pipeline):
         if self._text_encoder_on_gpu:
             return
         logger.info("Loading Gemma back to GPU...")
-        _move_module_to(self._text_encoder, self.device)
+        _move_module_to(self._text_encoder, self.device, non_blocking=True)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
         self._text_encoder_on_gpu = True
         _log_gpu_memory("gemma reloaded")
 
@@ -926,6 +930,9 @@ class LTX2Pipeline(Pipeline):
                 the safety margin can be scaled for self-attention memory.
         """
         if self._streaming_state is not None:
+            # Prompt changes may offload the scaffold while preserving the
+            # existing streaming hooks and pinned block memory.
+            self._move_transformer_scaffold_to_gpu()
             return
 
         self._move_transformer_scaffold_to_gpu()
@@ -968,6 +975,14 @@ class LTX2Pipeline(Pipeline):
     def _teardown_denoising(self):
         """Offload all blocks and scaffold to CPU to free GPU for other models."""
         self._cleanup_block_streaming()
+        self._move_transformer_scaffold_to_cpu()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _offload_denoising_for_text_encoder(self):
+        """Free denoising VRAM while keeping streaming hooks/pinned memory."""
+        if self._streaming_state is not None:
+            self._free_blocks_for_decode()
         self._move_transformer_scaffold_to_cpu()
         gc.collect()
         torch.cuda.empty_cache()
@@ -1022,8 +1037,9 @@ class LTX2Pipeline(Pipeline):
             # re-anchor at its end.
             self._wall_clock_start = None
 
-            # Gemma needs ~13 GB — free everything else first
-            self._teardown_denoising()
+            # Gemma needs ~13 GB — free denoising VRAM first, but keep the
+            # expensive block-streaming setup alive across prompt changes.
+            self._offload_denoising_for_text_encoder()
             self._offload_vaes()
 
             self._load_text_encoder()
@@ -1342,6 +1358,8 @@ class LTX2Pipeline(Pipeline):
         embedding connectors (only needed during text preprocessing,
         managed separately by _move_connectors_to_gpu/cpu).
         """
+        if getattr(self, "_transformer_scaffold_on_gpu", False):
+            return
         t = self._transformer
         for name, child in t.named_children():
             if name not in self._SCAFFOLD_EXCLUDE:
@@ -1350,8 +1368,11 @@ class LTX2Pipeline(Pipeline):
             param.data = param.data.to(device=self.device)
         for name, buf in t.named_buffers(recurse=False):
             buf.data = buf.data.to(device=self.device)
+        self._transformer_scaffold_on_gpu = True
 
     def _move_transformer_scaffold_to_cpu(self):
+        if not getattr(self, "_transformer_scaffold_on_gpu", False):
+            return
         t = self._transformer
         for name, child in t.named_children():
             if name not in self._SCAFFOLD_EXCLUDE:
@@ -1360,6 +1381,7 @@ class LTX2Pipeline(Pipeline):
             param.data = param.data.to(device="cpu")
         for name, buf in t.named_buffers(recurse=False):
             buf.data = buf.data.to(device="cpu")
+        self._transformer_scaffold_on_gpu = False
 
     def _cleanup_block_streaming(self):
         """Clean up block streaming and move all blocks back to CPU."""

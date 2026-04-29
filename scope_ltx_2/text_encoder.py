@@ -350,9 +350,10 @@ def encode_prompt(
 ) -> torch.Tensor:
     """Encode a text prompt using Gemma and return stacked hidden states.
 
-    Tokenizes plain text (no chat template) with left-padding, then strips
-    padding tokens so the output contains only real tokens.  This matches
-    ComfyUI's encode_token_weights flow where raw text is fed directly.
+    Tokenizes plain text (no chat template), then strips any padding tokens so
+    the output contains only real tokens.  Single-prompt encoding deliberately
+    avoids fixed 512-token padding; Gemma otherwise computes hundreds of unused
+    padding positions that are thrown away immediately after encoding.
 
     Returns:
         all_layer_hiddens: [B, T_real, D, L] hidden states from all transformer layers
@@ -361,7 +362,7 @@ def encode_prompt(
     inputs = tokenizer(
         prompt.strip(),
         return_tensors="pt",
-        padding="max_length",
+        padding=False,
         max_length=max_length,
         truncation=True,
     ).to(device)

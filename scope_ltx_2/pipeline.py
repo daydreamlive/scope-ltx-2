@@ -468,6 +468,12 @@ class LTX2Pipeline(Pipeline):
         self._wall_clock_start: float | None = None
         self._media_ticks_at_anchor: int = 0
 
+        # Hold-last-frame state.  Populated after the first generation; used
+        # to short-circuit subsequent identical calls when ``hold_last_frame``
+        # is enabled (see ``_generate``).
+        self._last_video_frame: torch.Tensor | None = None
+        self._last_gen_key: tuple | None = None
+
         logger.info(f"LTX 2.3 pipeline loaded in {time.time() - start:.1f}s")
         _log_gpu_memory("all loaded")
 
@@ -538,6 +544,9 @@ class LTX2Pipeline(Pipeline):
 
         self._wall_clock_start = None
         self._media_ticks_at_anchor = 0
+
+        self._last_video_frame = None
+        self._last_gen_key = None
 
         gc.collect()
         if torch.cuda.is_available():
@@ -1023,6 +1032,47 @@ class LTX2Pipeline(Pipeline):
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # =================================================================
+        # Repeat vs hold-last-frame short-circuit
+        #
+        # Default (``repeat=True``) keeps the original behaviour: each call
+        # re-runs diffusion, which with a fixed seed produces an identical
+        # clip — i.e. the visible loop the user sees when seed randomisation
+        # is off.  When ``repeat`` is disabled and the inputs still match the
+        # previously generated video (same prompt, seed, dimensions, etc.),
+        # skip generation and emit a chunk made of copies of the last frame
+        # with silent audio.
+        # =================================================================
+        repeat = bool(kwargs.get("repeat", True))
+
+        i2v_source_key = kwargs.get("i2v_image") or kwargs.get("first_frame_image")
+        if hasattr(i2v_source_key, "shape"):
+            i2v_source_key = ("tensor", tuple(i2v_source_key.shape))
+
+        gen_key = (
+            prompt_text,
+            seed,
+            int(height),
+            int(width),
+            int(num_frames),
+            float(frame_rate),
+            kwargs.get("num_steps", self.num_steps),
+            kwargs.get("schedule", self.schedule),
+            kwargs.get("audio_input"),
+            kwargs.get("audio_mode", "driving"),
+            i2v_source_key,
+            float(kwargs.get("i2v_strength", 1.0)),
+            float(kwargs.get("control_strength", 1.0)),
+        )
+
+        if (
+            not repeat
+            and self._last_video_frame is not None
+            and self._last_gen_key == gen_key
+        ):
+            logger.info("Repeat off: holding last frame")
+            return self._make_hold_chunk(num_frames, frame_rate)
+
+        # =================================================================
         # Text encoding (Gemma FP8 on GPU -> offload -> connectors)
         # =================================================================
         if self._cached_prompt_text == prompt_text and self._cached_context is not None:
@@ -1312,10 +1362,43 @@ class LTX2Pipeline(Pipeline):
             kwargs.get("realtime_pacing_slack", self.realtime_pacing_slack)
         )
 
+        # Cache last frame so a follow-up call with the same inputs can
+        # hold instead of regenerating when ``hold_last_frame`` is on.
+        if video_tensor.shape[0] > 0:
+            self._last_video_frame = video_tensor[-1].detach().cpu().clone()
+            self._last_gen_key = gen_key
+
         return {
             "video": video_tensor,
             "video_timestamps": video_timestamps,
             "audio": audio_tensor,
+            "audio_sample_rate": audio_sample_rate,
+            "audio_timestamps": audio_timestamps,
+            "frame_rate": frame_rate,
+        }
+
+    def _make_hold_chunk(self, num_frames: int, frame_rate: float) -> dict:
+        """Build a chunk that repeats the cached last frame with silent audio."""
+        last = self._last_video_frame
+        assert last is not None
+        video = last.unsqueeze(0).expand(num_frames, -1, -1, -1).contiguous()
+
+        audio_sample_rate = 48000
+        audio_samples = max(1, int(round(num_frames * audio_sample_rate / frame_rate)))
+        audio = torch.zeros(2, audio_samples)
+
+        video_timestamps, audio_timestamps = self._advance_chunk_timestamps(
+            num_frames=video.shape[0],
+            audio_samples=audio.shape[-1],
+            audio_sample_rate=audio_sample_rate,
+        )
+
+        self._realtime_throttle(self.realtime_pacing_slack)
+
+        return {
+            "video": video,
+            "video_timestamps": video_timestamps,
+            "audio": audio,
             "audio_sample_rate": audio_sample_rate,
             "audio_timestamps": audio_timestamps,
             "frame_rate": frame_rate,

@@ -318,6 +318,23 @@ class LTX2Config(BasePipelineConfig):
         ),
     )
 
+    # Loop vs hold-last-frame behaviour for deterministic seeds
+    repeat: bool = Field(
+        default=True,
+        description=(
+            "When enabled, the same clip is regenerated on every call "
+            "(looping behaviour). When disabled, after the first clip is "
+            "generated its last frame is held (with silent audio) until an "
+            "input that affects the output changes (prompt, seed, dimensions, "
+            "frame count, schedule, i2v image, etc.). Most useful with "
+            "Randomize Seed off — set Repeat to false to stop the same clip "
+            "looping forever and freeze on the final frame instead."
+        ),
+        json_schema_extra=ui_field_config(
+            order=9, label="Repeat", is_load_param=False
+        ),
+    )
+
     # Image-to-video conditioning
     i2v_image: str | None = Field(
         default=None,

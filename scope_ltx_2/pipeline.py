@@ -218,14 +218,12 @@ def _load_image_tensor(source, device: torch.device, dtype: torch.dtype) -> torc
 
 
 def _input_fingerprint(source):
-    """Hashable identity for a generation input (path, tensor, list of
-    tensors, or ``None``). Used to key the hold-last-frame cache so that
-    swapping the input forces regeneration.
+    """Hashable identity for a generation input. Used to key the hold-
+    last-frame cache so that swapping the input forces regeneration.
 
-    For tensors we use ``(shape, dtype, data_ptr)`` rather than a content
-    hash — distinct tensor objects get distinct keys, which is what we
-    want. The trade-off is that if a caller reuses the same buffer with
-    new content, the change is missed; that's rare and easy to diagnose.
+    Tensors use ``(shape, dtype, data_ptr)`` rather than a content hash —
+    distinct tensor objects get distinct keys. The trade-off is that
+    in-place buffer reuse is missed; rare and easy to diagnose.
     """
     if source is None:
         return None
@@ -233,8 +231,6 @@ def _input_fingerprint(source):
         return str(source)
     if isinstance(source, torch.Tensor):
         return ("tensor", tuple(source.shape), str(source.dtype), int(source.data_ptr()))
-    if isinstance(source, (list, tuple)):
-        return tuple(_input_fingerprint(x) for x in source)
     return repr(source)
 
 
@@ -582,7 +578,6 @@ class LTX2Pipeline(Pipeline):
 
         self._last_video_frame = None
         self._last_gen_key = None
-        self._last_audio_sample_rate = 48000
         self._last_chunk_was_hold = False
         self._idle_loop_frames = None
         self._idle_loop_cache_key = None
@@ -1067,21 +1062,10 @@ class LTX2Pipeline(Pipeline):
         if width != width_raw:
             logger.info(f"Snapped width {width_raw} -> {width} (must be multiple of {VAE_SPATIAL_FACTOR})")
 
-        # =================================================================
-        # Repeat vs hold-last-frame short-circuit
-        #
-        # Default (``repeat=True``) keeps the original behaviour: each call
-        # re-runs diffusion, which with a fixed seed produces an identical
-        # clip — i.e. the visible loop the user sees when seed randomisation
-        # is off.  When ``repeat`` is disabled and the inputs still match the
-        # previously generated video (same prompt, seed, dimensions, etc.),
-        # skip generation and emit a chunk made of copies of the last frame
-        # with silent audio.
-        #
-        # ``randomize_seed`` is suppressed while ``repeat=False`` — otherwise
-        # every call would re-randomise the seed, ``gen_key`` would never
-        # match, and the hold path would never fire.
-        # =================================================================
+        # Repeat=False short-circuits to a hold chunk when ``gen_key`` (built
+        # below) matches the last real generation. randomize_seed is forced
+        # off in that mode — otherwise the seed would change every call and
+        # the key would never match.
         repeat = bool(kwargs.get("repeat", True))
         randomize_seed = kwargs.get("randomize_seed", self.randomize_seed)
 
@@ -1423,12 +1407,8 @@ class LTX2Pipeline(Pipeline):
             self._last_gen_key = gen_key
             self._last_audio_sample_rate = int(audio_sample_rate)
 
-        # The first real chunk after a stretch of hold chunks must arrive at
-        # the screen perfectly A/V-locked. The audio track (wall-clock 48 kHz)
-        # and video track (preserved-PTS) buffers drift apart while holding,
-        # so signal a discontinuity that drops both stale buffers downstream
-        # and lets the new chunk land fresh. We accept that the in-flight
-        # idle loop is cut off — A/V sync at the new clip start matters more.
+        # Flag the first real chunk after a hold so downstream drops its
+        # stale A/V buffers and re-locks at the new clip start.
         emit_discontinuity = self._last_chunk_was_hold
         self._last_chunk_was_hold = False
 
@@ -1480,13 +1460,9 @@ class LTX2Pipeline(Pipeline):
             audio_sample_rate=audio_sample_rate,
         )
 
-        # Hold chunks are essentially free to generate (tensor copy + zeros),
-        # so the user-facing slack (which protects expensive real generation)
-        # would just let the pipeline burst many seconds of frames into the
-        # downstream queues — that's what made the idle loop look uneven and
-        # what slowly drifted the audio buffer out of sync with the video
-        # buffer. Pace strictly against wall-clock here so each hold chunk
-        # only ships once the previous one has actually been consumed.
+        # Hold chunks are essentially free (tensor copy + zeros); pace
+        # strictly against wall-clock so cheap chunks don't burst into the
+        # downstream queues and drift the audio buffer out of sync.
         self._realtime_throttle(0.0, force=True)
 
         self._last_chunk_was_hold = True

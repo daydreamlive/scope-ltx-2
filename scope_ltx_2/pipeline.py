@@ -473,6 +473,10 @@ class LTX2Pipeline(Pipeline):
         # is enabled (see ``_generate``).
         self._last_video_frame: torch.Tensor | None = None
         self._last_gen_key: tuple | None = None
+        # True iff the previously emitted chunk was a hold chunk.  Used to
+        # flag the first real chunk after a hold sequence so downstream
+        # buffers can be flushed and A/V re-locked.
+        self._last_chunk_was_hold: bool = False
 
         logger.info(f"LTX 2.3 pipeline loaded in {time.time() - start:.1f}s")
         _log_gpu_memory("all loaded")
@@ -1368,7 +1372,16 @@ class LTX2Pipeline(Pipeline):
             self._last_video_frame = video_tensor[-1].detach().cpu().clone()
             self._last_gen_key = gen_key
 
-        return {
+        # The first real chunk after a stretch of hold chunks needs to flush
+        # any stale silence / last-frame still queued downstream so the new
+        # video and audio land at the same wall-clock instant in WebRTC.
+        # Independent audio (wall-clock 48 kHz) and video (preserved-PTS)
+        # buffers drift apart while holding, so we have to tell the server
+        # to drop both buffered streams before pushing the new chunk in.
+        emit_discontinuity = self._last_chunk_was_hold
+        self._last_chunk_was_hold = False
+
+        chunk = {
             "video": video_tensor,
             "video_timestamps": video_timestamps,
             "audio": audio_tensor,
@@ -1376,6 +1389,9 @@ class LTX2Pipeline(Pipeline):
             "audio_timestamps": audio_timestamps,
             "frame_rate": frame_rate,
         }
+        if emit_discontinuity:
+            chunk["discontinuity"] = True
+        return chunk
 
     def _make_hold_chunk(self, num_frames: int, frame_rate: float) -> dict:
         """Build a chunk that repeats the cached last frame with silent audio."""
@@ -1394,6 +1410,8 @@ class LTX2Pipeline(Pipeline):
         )
 
         self._realtime_throttle(self.realtime_pacing_slack)
+
+        self._last_chunk_was_hold = True
 
         return {
             "video": video,

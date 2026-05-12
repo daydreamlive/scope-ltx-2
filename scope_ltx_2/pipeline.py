@@ -217,6 +217,27 @@ def _load_image_tensor(source, device: torch.device, dtype: torch.dtype) -> torc
     return t
 
 
+def _input_fingerprint(source):
+    """Hashable identity for a generation input (path, tensor, list of
+    tensors, or ``None``). Used to key the hold-last-frame cache so that
+    swapping the input forces regeneration.
+
+    For tensors we use ``(shape, dtype, data_ptr)`` rather than a content
+    hash — distinct tensor objects get distinct keys, which is what we
+    want. The trade-off is that if a caller reuses the same buffer with
+    new content, the change is missed; that's rare and easy to diagnose.
+    """
+    if source is None:
+        return None
+    if isinstance(source, (str, Path)):
+        return str(source)
+    if isinstance(source, torch.Tensor):
+        return ("tensor", tuple(source.shape), str(source.dtype), int(source.data_ptr()))
+    if isinstance(source, (list, tuple)):
+        return tuple(_input_fingerprint(x) for x in source)
+    return repr(source)
+
+
 class LTX2Pipeline(Pipeline):
     """LTX 2.3 audio-video generation pipeline."""
 
@@ -469,10 +490,14 @@ class LTX2Pipeline(Pipeline):
         self._media_ticks_at_anchor: int = 0
 
         # Hold-last-frame state.  Populated after the first generation; used
-        # to short-circuit subsequent identical calls when ``hold_last_frame``
-        # is enabled (see ``_generate``).
+        # to short-circuit subsequent identical calls when ``repeat=False``
+        # (see ``_generate``).
         self._last_video_frame: torch.Tensor | None = None
         self._last_gen_key: tuple | None = None
+        # Sample rate of the last real chunk.  Reused by hold chunks so the
+        # audio track keeps a single sample rate across the hold transition
+        # (avoids a hidden sample-rate discontinuity at hold entry).
+        self._last_audio_sample_rate: int = 48000
         # True iff the previously emitted chunk was a hold chunk.  Used to
         # flag the first real chunk after a hold sequence so downstream
         # buffers can be flushed and A/V re-locked.
@@ -557,6 +582,11 @@ class LTX2Pipeline(Pipeline):
 
         self._last_video_frame = None
         self._last_gen_key = None
+        self._last_audio_sample_rate = 48000
+        self._last_chunk_was_hold = False
+        self._idle_loop_frames = None
+        self._idle_loop_cache_key = None
+        self._idle_loop_cursor = 0
 
         gc.collect()
         if torch.cuda.is_available():
@@ -913,20 +943,23 @@ class LTX2Pipeline(Pipeline):
         self._media_ticks = base_ticks + int(round(chunk_duration_ticks))
         return video_ts, audio_ts
 
-    def _realtime_throttle(self, slack: float) -> None:
+    def _realtime_throttle(self, slack: float, *, force: bool = False) -> None:
         """Back-pressure to keep media production near wall-clock pace.
 
-        If ``slack >= 0`` and the media time produced since the last anchor
-        has run more than ``(1 + slack)`` faster than wall-clock, sleep until
-        the two are back at parity (ratio 1.0). ``slack < 0`` disables
-        throttling entirely (used for benchmarks where we want to measure
-        raw generation speed).
+        If ``slack > 0`` and the media time produced since the last anchor has
+        run more than ``(1 + slack)`` faster than wall-clock, sleep until the
+        two are back at parity (ratio 1.0).
+
+        ``force=True`` paces even when ``slack <= 0``; used internally by
+        hold chunks, which must hit wall-clock exactly regardless of the
+        user's slack setting (cheap chunks would otherwise burst into the
+        downstream queues).
 
         The anchor is established after the first batch and after any slow
         action (e.g. a prompt change that reloads the text encoder), so
         those large one-off costs don't inflate the realtime budget.
         """
-        if slack < 0.0:
+        if not force and slack <= 0.0:
             return
         now = time.monotonic()
         if self._wall_clock_start is None:
@@ -1034,15 +1067,6 @@ class LTX2Pipeline(Pipeline):
         if width != width_raw:
             logger.info(f"Snapped width {width_raw} -> {width} (must be multiple of {VAE_SPATIAL_FACTOR})")
 
-        randomize_seed = kwargs.get("randomize_seed", self.randomize_seed)
-
-        if randomize_seed:
-            seed = random.randint(0, 2**31 - 1)
-            logger.info(f"Randomized seed: {seed}")
-
-        prompt_text = prompts[0]["text"] if prompts else "a beautiful sunset"
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-
         # =================================================================
         # Repeat vs hold-last-frame short-circuit
         #
@@ -1053,12 +1077,23 @@ class LTX2Pipeline(Pipeline):
         # previously generated video (same prompt, seed, dimensions, etc.),
         # skip generation and emit a chunk made of copies of the last frame
         # with silent audio.
+        #
+        # ``randomize_seed`` is suppressed while ``repeat=False`` — otherwise
+        # every call would re-randomise the seed, ``gen_key`` would never
+        # match, and the hold path would never fire.
         # =================================================================
         repeat = bool(kwargs.get("repeat", True))
+        randomize_seed = kwargs.get("randomize_seed", self.randomize_seed)
 
-        i2v_source_key = kwargs.get("i2v_image") or kwargs.get("first_frame_image")
-        if hasattr(i2v_source_key, "shape"):
-            i2v_source_key = ("tensor", tuple(i2v_source_key.shape))
+        if randomize_seed and not repeat:
+            logger.info("Repeat off: ignoring randomize_seed")
+            randomize_seed = False
+        if randomize_seed:
+            seed = random.randint(0, 2**31 - 1)
+            logger.info(f"Randomized seed: {seed}")
+
+        prompt_text = prompts[0]["text"] if prompts else "a beautiful sunset"
+        generator = torch.Generator(device=self.device).manual_seed(seed)
 
         gen_key = (
             prompt_text,
@@ -1069,10 +1104,13 @@ class LTX2Pipeline(Pipeline):
             float(frame_rate),
             kwargs.get("num_steps", self.num_steps),
             kwargs.get("schedule", self.schedule),
-            kwargs.get("audio_input"),
+            _input_fingerprint(kwargs.get("audio_input")),
             kwargs.get("audio_mode", "driving"),
-            i2v_source_key,
+            _input_fingerprint(
+                kwargs.get("i2v_image") or kwargs.get("first_frame_image")
+            ),
             float(kwargs.get("i2v_strength", 1.0)),
+            _input_fingerprint(kwargs.get("video")),
             float(kwargs.get("control_strength", 1.0)),
         )
 
@@ -1379,10 +1417,11 @@ class LTX2Pipeline(Pipeline):
         )
 
         # Cache last frame so a follow-up call with the same inputs can
-        # hold instead of regenerating when ``hold_last_frame`` is on.
+        # hold instead of regenerating when ``repeat=False``.
         if video_tensor.shape[0] > 0:
             self._last_video_frame = video_tensor[-1].detach().cpu().clone()
             self._last_gen_key = gen_key
+            self._last_audio_sample_rate = int(audio_sample_rate)
 
         # The first real chunk after a stretch of hold chunks must arrive at
         # the screen perfectly A/V-locked. The audio track (wall-clock 48 kHz)
@@ -1429,7 +1468,9 @@ class LTX2Pipeline(Pipeline):
         else:
             video = last.unsqueeze(0).expand(num_frames, -1, -1, -1).contiguous()
 
-        audio_sample_rate = 48000
+        # Match the prior real chunk's sample rate so the audio stream
+        # doesn't see a hidden sample-rate change at hold entry.
+        audio_sample_rate = self._last_audio_sample_rate
         audio_samples = max(1, int(round(num_frames * audio_sample_rate / frame_rate)))
         audio = torch.zeros(2, audio_samples)
 
@@ -1446,7 +1487,7 @@ class LTX2Pipeline(Pipeline):
         # what slowly drifted the audio buffer out of sync with the video
         # buffer. Pace strictly against wall-clock here so each hold chunk
         # only ships once the previous one has actually been consumed.
-        self._realtime_throttle(0.0)
+        self._realtime_throttle(0.0, force=True)
 
         self._last_chunk_was_hold = True
 

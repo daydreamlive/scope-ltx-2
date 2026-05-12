@@ -288,12 +288,12 @@ class LTX2Config(BasePipelineConfig):
         default=0.5,
         ge=0.0,
         description=(
-            "Sleep after each generated batch when accumulated media time "
+            "If > 0, sleep after each generated batch when accumulated media time "
             "exceeds wall-clock by more than this fraction. Prevents unbounded "
             "playback backlog when inference runs faster than realtime. "
             "Example: 0.1 allows media to run up to 10% ahead of wall-clock "
             "before throttling back to match the expected wall-clock. "
-            "0 enforces strict wall-clock pacing (no slack). Default 0.5"
+            "0 disables pacing. Default 0.5"
         ),
         json_schema_extra=ui_field_config(
             order=8, label="Realtime Pacing Slack", is_load_param=False
@@ -326,12 +326,12 @@ class LTX2Config(BasePipelineConfig):
             "(looping behaviour). When disabled, after the first clip is "
             "generated its last frame is held (with silent audio) until an "
             "input that affects the output changes (prompt, seed, dimensions, "
-            "frame count, schedule, i2v image, etc.). Most useful with "
-            "Randomize Seed off — set Repeat to false to stop the same clip "
-            "looping forever and freeze on the final frame instead."
+            "frame count, schedule, i2v image, etc.). When Repeat is off, "
+            "Randomize Seed is ignored — otherwise the seed would change on "
+            "every call and the hold would never trigger."
         ),
         json_schema_extra=ui_field_config(
-            order=9, label="Repeat", is_load_param=False
+            order=10, label="Repeat", is_load_param=False
         ),
     )
 
@@ -349,7 +349,7 @@ class LTX2Config(BasePipelineConfig):
             "falls back to holding the last frame."
         ),
         json_schema_extra=ui_field_config(
-            order=9, component="video", label="Idle Loop Clip",
+            order=11, component="video", label="Idle Loop Clip",
             is_load_param=False,
         ),
     )
@@ -359,7 +359,7 @@ class LTX2Config(BasePipelineConfig):
         default=None,
         description="Reference image for image-to-video generation. The first frame is conditioned on this image.",
         json_schema_extra=ui_field_config(
-            order=10, component="image", label="I2V Reference Image",
+            order=12, component="image", label="I2V Reference Image",
             is_load_param=False, category="input",
         ),
     )
@@ -374,7 +374,7 @@ class LTX2Config(BasePipelineConfig):
             "0.0 = no conditioning (pure text-to-video)."
         ),
         json_schema_extra=ui_field_config(
-            order=11, label="I2V Strength", is_load_param=False, category="input",
+            order=13, label="I2V Strength", is_load_param=False, category="input",
         ),
     )
 
@@ -389,7 +389,7 @@ class LTX2Config(BasePipelineConfig):
             "Reference video frames arrive via the video graph port."
         ),
         json_schema_extra=ui_field_config(
-            order=12, label="Control Strength", is_load_param=False,
+            order=14, label="Control Strength", is_load_param=False,
             category="input", modes=["video"],
         ),
     )
@@ -403,7 +403,7 @@ class LTX2Config(BasePipelineConfig):
             "speaker identity reference (~5 s recommended; requires ID-LoRA weights)."
         ),
         json_schema_extra=ui_field_config(
-            order=13, component="audio", label="Audio Input",
+            order=15, component="audio", label="Audio Input",
             is_load_param=False, category="input",
         ),
     )
@@ -417,7 +417,7 @@ class LTX2Config(BasePipelineConfig):
             "matches the voice (requires ID-LoRA LoRA weights)."
         ),
         json_schema_extra=ui_field_config(
-            order=14, label="Audio Mode", is_load_param=False,
+            order=16, label="Audio Mode", is_load_param=False,
             category="input",
         ),
     )
@@ -432,7 +432,7 @@ class LTX2Config(BasePipelineConfig):
             "Only active in id_lora mode."
         ),
         json_schema_extra=ui_field_config(
-            order=15, label="Identity Guidance", is_load_param=False,
+            order=17, label="Identity Guidance", is_load_param=False,
             category="input",
         ),
     )

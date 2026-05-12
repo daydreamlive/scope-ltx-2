@@ -288,12 +288,12 @@ class LTX2Config(BasePipelineConfig):
         default=0.5,
         ge=0.0,
         description=(
-            "If > 0, sleep after each generated batch when accumulated media time "
+            "Sleep after each generated batch when accumulated media time "
             "exceeds wall-clock by more than this fraction. Prevents unbounded "
             "playback backlog when inference runs faster than realtime. "
             "Example: 0.1 allows media to run up to 10% ahead of wall-clock "
             "before throttling back to match the expected wall-clock. "
-            "0 disables pacing. Default 0.5"
+            "0 enforces strict wall-clock pacing (no slack). Default 0.5"
         ),
         json_schema_extra=ui_field_config(
             order=8, label="Realtime Pacing Slack", is_load_param=False
@@ -332,6 +332,25 @@ class LTX2Config(BasePipelineConfig):
         ),
         json_schema_extra=ui_field_config(
             order=9, label="Repeat", is_load_param=False
+        ),
+    )
+
+    # Optional idle-loop clip played during hold (Repeat=false)
+    idle_loop_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional path to a short video clip played in a loop while the "
+            "pipeline is holding (Repeat=false, no new inputs). Audio is "
+            "silent. Use this to keep an avatar gently moving while waiting "
+            "for the next prompt instead of freezing on the last frame. The "
+            "clip should be designed to loop seamlessly (first frame ≈ last "
+            "frame); if it does not, mirror it (forward+reverse) before "
+            "exporting. If the path is unset or fails to load, the pipeline "
+            "falls back to holding the last frame."
+        ),
+        json_schema_extra=ui_field_config(
+            order=9, component="video", label="Idle Loop Clip",
+            is_load_param=False,
         ),
     )
 

@@ -1103,7 +1103,6 @@ class LTX2Pipeline(Pipeline):
             and self._last_video_frame is not None
             and self._last_gen_key == gen_key
         ):
-            logger.info("Repeat off: holding last frame")
             return self._make_hold_chunk(
                 num_frames,
                 frame_rate,

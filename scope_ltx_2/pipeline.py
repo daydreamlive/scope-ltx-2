@@ -296,6 +296,25 @@ class LTX2Pipeline(Pipeline):
 
         self.device = device
         self.dtype = dtype
+
+        # On GPUs with plenty of VRAM, keep Gemma / VAEs / text projection /
+        # caption connectors resident on the device. The default code path
+        # offloads everything to CPU after each prompt encoding so the
+        # pipeline fits on a 24GB card; on a 40GB+ device that bounce
+        # (CPU↔GPU on Gemma + VAEs + connectors + text_projection) burns
+        # ~10 s every prompt change for no benefit.
+        if self.device.type == "cuda":
+            total_vram_gb = (
+                torch.cuda.get_device_properties(self.device).total_memory / 1024**3
+            )
+            self._high_vram_mode = total_vram_gb >= 40.0
+            if self._high_vram_mode:
+                logger.info(
+                    f"High-VRAM mode enabled ({total_vram_gb:.1f} GB total): "
+                    "text encoder / VAEs / connectors stay resident on GPU"
+                )
+        else:
+            self._high_vram_mode = False
         self.height = height
         self.width = width
         self.num_frames = num_frames
@@ -398,6 +417,8 @@ class LTX2Pipeline(Pipeline):
             self._text_projection = TextEmbeddingProjection.from_checkpoint(
                 text_projection_path, dtype=dtype, preloaded_sd=fut_text_proj_sd.result()
             )
+            if self._high_vram_mode:
+                self._text_projection.to(self.device)
 
             # Step 3: Load transformer to CPU.  This runs while the Gemma
             # background thread is still transferring FP8 weights to GPU.
@@ -650,6 +671,8 @@ class LTX2Pipeline(Pipeline):
                 block.audio_ff = block.audio_ff.ff
 
     def _offload_text_encoder(self):
+        if self._high_vram_mode:
+            return
         if not self._text_encoder_on_gpu:
             return
         logger.info("Offloading Gemma to CPU...")
@@ -689,6 +712,8 @@ class LTX2Pipeline(Pipeline):
 
     def _offload_vaes(self):
         """Offload all VAE models to CPU to free VRAM for text encoder."""
+        if self._high_vram_mode:
+            return
         if not self._vaes_on_gpu:
             return
         logger.info("Offloading VAEs to CPU...")
@@ -1030,6 +1055,8 @@ class LTX2Pipeline(Pipeline):
 
     def _offload_denoising_for_text_encoder(self):
         """Free denoising VRAM while keeping streaming hooks/pinned memory."""
+        if self._high_vram_mode:
+            return
         if self._streaming_state is not None:
             self._free_blocks_for_decode()
         self._move_transformer_scaffold_to_cpu()
@@ -1144,7 +1171,8 @@ class LTX2Pipeline(Pipeline):
 
             self._text_projection.to(self.device)
             projected = self._text_projection(all_layer_hiddens)
-            self._text_projection.to("cpu")
+            if not self._high_vram_mode:
+                self._text_projection.to("cpu")
             del all_layer_hiddens
             logger.info(f"Text projection done: {projected.shape}")
 
@@ -1348,7 +1376,11 @@ class LTX2Pipeline(Pipeline):
         # Offload resident blocks to free VRAM for VAE decode.
         # Streaming state (hooks, pinned memory, scaffold) persists — resident
         # blocks will be reloaded by pre-forward hooks on the next denoising pass.
-        self._free_blocks_for_decode()
+        # In high-VRAM mode we have plenty of headroom to run the VAE decode
+        # with all transformer blocks still resident, saving the
+        # offload+reload PCIe round-trip (~1 s per chunk).
+        if not self._high_vram_mode:
+            self._free_blocks_for_decode()
 
         # =================================================================
         # VAE decode
@@ -1544,6 +1576,8 @@ class LTX2Pipeline(Pipeline):
         _log_gpu_memory("connectors on GPU")
 
     def _move_connectors_to_cpu(self):
+        if self._high_vram_mode:
+            return
         t = self._transformer
         for attr in ("video_embeddings_connector", "audio_embeddings_connector",
                       "caption_projection", "audio_caption_projection"):

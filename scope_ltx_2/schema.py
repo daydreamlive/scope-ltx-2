@@ -318,12 +318,48 @@ class LTX2Config(BasePipelineConfig):
         ),
     )
 
+    # Loop vs hold-last-frame behaviour for deterministic seeds
+    repeat: bool = Field(
+        default=True,
+        description=(
+            "When enabled, the same clip is regenerated on every call "
+            "(looping behaviour). When disabled, after the first clip is "
+            "generated its last frame is held (with silent audio) until an "
+            "input that affects the output changes (prompt, seed, dimensions, "
+            "frame count, schedule, i2v image, etc.). When Repeat is off, "
+            "Randomize Seed is ignored — otherwise the seed would change on "
+            "every call and the hold would never trigger."
+        ),
+        json_schema_extra=ui_field_config(
+            order=10, label="Repeat", is_load_param=False
+        ),
+    )
+
+    # Optional idle-loop clip played during hold (Repeat=false)
+    idle_loop_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional path to a short video clip played in a loop while the "
+            "pipeline is holding (Repeat=false, no new inputs). Audio is "
+            "silent. Use this to keep an avatar gently moving while waiting "
+            "for the next prompt instead of freezing on the last frame. The "
+            "clip should be designed to loop seamlessly (first frame ≈ last "
+            "frame); if it does not, mirror it (forward+reverse) before "
+            "exporting. If the path is unset or fails to load, the pipeline "
+            "falls back to holding the last frame."
+        ),
+        json_schema_extra=ui_field_config(
+            order=11, component="video", label="Idle Loop Clip",
+            is_load_param=False,
+        ),
+    )
+
     # Image-to-video conditioning
     i2v_image: str | None = Field(
         default=None,
         description="Reference image for image-to-video generation. The first frame is conditioned on this image.",
         json_schema_extra=ui_field_config(
-            order=10, component="image", label="I2V Reference Image",
+            order=12, component="image", label="I2V Reference Image",
             is_load_param=False, category="input",
         ),
     )
@@ -338,7 +374,7 @@ class LTX2Config(BasePipelineConfig):
             "0.0 = no conditioning (pure text-to-video)."
         ),
         json_schema_extra=ui_field_config(
-            order=11, label="I2V Strength", is_load_param=False, category="input",
+            order=13, label="I2V Strength", is_load_param=False, category="input",
         ),
     )
 
@@ -353,7 +389,7 @@ class LTX2Config(BasePipelineConfig):
             "Reference video frames arrive via the video graph port."
         ),
         json_schema_extra=ui_field_config(
-            order=12, label="Control Strength", is_load_param=False,
+            order=14, label="Control Strength", is_load_param=False,
             category="input", modes=["video"],
         ),
     )
@@ -367,7 +403,7 @@ class LTX2Config(BasePipelineConfig):
             "speaker identity reference (~5 s recommended; requires ID-LoRA weights)."
         ),
         json_schema_extra=ui_field_config(
-            order=13, component="audio", label="Audio Input",
+            order=15, component="audio", label="Audio Input",
             is_load_param=False, category="input",
         ),
     )
@@ -381,7 +417,7 @@ class LTX2Config(BasePipelineConfig):
             "matches the voice (requires ID-LoRA LoRA weights)."
         ),
         json_schema_extra=ui_field_config(
-            order=14, label="Audio Mode", is_load_param=False,
+            order=16, label="Audio Mode", is_load_param=False,
             category="input",
         ),
     )
@@ -396,7 +432,7 @@ class LTX2Config(BasePipelineConfig):
             "Only active in id_lora mode."
         ),
         json_schema_extra=ui_field_config(
-            order=15, label="Identity Guidance", is_load_param=False,
+            order=17, label="Identity Guidance", is_load_param=False,
             category="input",
         ),
     )

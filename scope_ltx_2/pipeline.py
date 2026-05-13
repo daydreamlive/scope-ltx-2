@@ -217,6 +217,23 @@ def _load_image_tensor(source, device: torch.device, dtype: torch.dtype) -> torc
     return t
 
 
+def _input_fingerprint(source):
+    """Hashable identity for a generation input. Used to key the hold-
+    last-frame cache so that swapping the input forces regeneration.
+
+    Tensors use ``(shape, dtype, data_ptr)`` rather than a content hash —
+    distinct tensor objects get distinct keys. The trade-off is that
+    in-place buffer reuse is missed; rare and easy to diagnose.
+    """
+    if source is None:
+        return None
+    if isinstance(source, (str, Path)):
+        return str(source)
+    if isinstance(source, torch.Tensor):
+        return ("tensor", tuple(source.shape), str(source.dtype), int(source.data_ptr()))
+    return repr(source)
+
+
 class LTX2Pipeline(Pipeline):
     """LTX 2.3 audio-video generation pipeline."""
 
@@ -468,6 +485,26 @@ class LTX2Pipeline(Pipeline):
         self._wall_clock_start: float | None = None
         self._media_ticks_at_anchor: int = 0
 
+        # Hold-last-frame state.  Populated after the first generation; used
+        # to short-circuit subsequent identical calls when ``repeat=False``
+        # (see ``_generate``).
+        self._last_video_frame: torch.Tensor | None = None
+        self._last_gen_key: tuple | None = None
+        # Sample rate of the last real chunk.  Reused by hold chunks so the
+        # audio track keeps a single sample rate across the hold transition
+        # (avoids a hidden sample-rate discontinuity at hold entry).
+        self._last_audio_sample_rate: int = 48000
+        # True iff the previously emitted chunk was a hold chunk.  Used to
+        # flag the first real chunk after a hold sequence so downstream
+        # buffers can be flushed and A/V re-locked.
+        self._last_chunk_was_hold: bool = False
+        # Optional pre-rendered idle-loop clip played during holds.  Cached
+        # by the path + (height, width) it was decoded for; cleared when the
+        # configured path changes or output dimensions change.
+        self._idle_loop_frames: torch.Tensor | None = None
+        self._idle_loop_cache_key: tuple | None = None
+        self._idle_loop_cursor: int = 0
+
         logger.info(f"LTX 2.3 pipeline loaded in {time.time() - start:.1f}s")
         _log_gpu_memory("all loaded")
 
@@ -538,6 +575,13 @@ class LTX2Pipeline(Pipeline):
 
         self._wall_clock_start = None
         self._media_ticks_at_anchor = 0
+
+        self._last_video_frame = None
+        self._last_gen_key = None
+        self._last_chunk_was_hold = False
+        self._idle_loop_frames = None
+        self._idle_loop_cache_key = None
+        self._idle_loop_cursor = 0
 
         gc.collect()
         if torch.cuda.is_available():
@@ -894,18 +938,23 @@ class LTX2Pipeline(Pipeline):
         self._media_ticks = base_ticks + int(round(chunk_duration_ticks))
         return video_ts, audio_ts
 
-    def _realtime_throttle(self, slack: float) -> None:
+    def _realtime_throttle(self, slack: float, *, force: bool = False) -> None:
         """Back-pressure to keep media production near wall-clock pace.
 
         If ``slack > 0`` and the media time produced since the last anchor has
         run more than ``(1 + slack)`` faster than wall-clock, sleep until the
         two are back at parity (ratio 1.0).
 
+        ``force=True`` paces even when ``slack <= 0``; used internally by
+        hold chunks, which must hit wall-clock exactly regardless of the
+        user's slack setting (cheap chunks would otherwise burst into the
+        downstream queues).
+
         The anchor is established after the first batch and after any slow
         action (e.g. a prompt change that reloads the text encoder), so
         those large one-off costs don't inflate the realtime budget.
         """
-        if slack <= 0.0:
+        if not force and slack <= 0.0:
             return
         now = time.monotonic()
         if self._wall_clock_start is None:
@@ -1013,14 +1062,52 @@ class LTX2Pipeline(Pipeline):
         if width != width_raw:
             logger.info(f"Snapped width {width_raw} -> {width} (must be multiple of {VAE_SPATIAL_FACTOR})")
 
+        # Repeat=False short-circuits to a hold chunk when ``gen_key`` (built
+        # below) matches the last real generation. randomize_seed is forced
+        # off in that mode — otherwise the seed would change every call and
+        # the key would never match.
+        repeat = bool(kwargs.get("repeat", True))
         randomize_seed = kwargs.get("randomize_seed", self.randomize_seed)
 
+        if randomize_seed and not repeat:
+            logger.info("Repeat off: ignoring randomize_seed")
+            randomize_seed = False
         if randomize_seed:
             seed = random.randint(0, 2**31 - 1)
             logger.info(f"Randomized seed: {seed}")
 
         prompt_text = prompts[0]["text"] if prompts else "a beautiful sunset"
         generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        gen_key = (
+            prompt_text,
+            seed,
+            int(height),
+            int(width),
+            int(num_frames),
+            float(frame_rate),
+            kwargs.get("num_steps", self.num_steps),
+            kwargs.get("schedule", self.schedule),
+            _input_fingerprint(kwargs.get("audio_input")),
+            kwargs.get("audio_mode", "driving"),
+            _input_fingerprint(
+                kwargs.get("i2v_image") or kwargs.get("first_frame_image")
+            ),
+            float(kwargs.get("i2v_strength", 1.0)),
+            _input_fingerprint(kwargs.get("video")),
+            float(kwargs.get("control_strength", 1.0)),
+        )
+
+        if (
+            not repeat
+            and self._last_video_frame is not None
+            and self._last_gen_key == gen_key
+        ):
+            return self._make_hold_chunk(
+                num_frames,
+                frame_rate,
+                idle_loop_path=kwargs.get("idle_loop_path"),
+            )
 
         # =================================================================
         # Text encoding (Gemma FP8 on GPU -> offload -> connectors)
@@ -1312,7 +1399,19 @@ class LTX2Pipeline(Pipeline):
             kwargs.get("realtime_pacing_slack", self.realtime_pacing_slack)
         )
 
-        return {
+        # Cache last frame so a follow-up call with the same inputs can
+        # hold instead of regenerating when ``repeat=False``.
+        if video_tensor.shape[0] > 0:
+            self._last_video_frame = video_tensor[-1].detach().cpu().clone()
+            self._last_gen_key = gen_key
+            self._last_audio_sample_rate = int(audio_sample_rate)
+
+        # Flag the first real chunk after a hold so downstream drops its
+        # stale A/V buffers and re-locks at the new clip start.
+        emit_discontinuity = self._last_chunk_was_hold
+        self._last_chunk_was_hold = False
+
+        chunk = {
             "video": video_tensor,
             "video_timestamps": video_timestamps,
             "audio": audio_tensor,
@@ -1320,6 +1419,115 @@ class LTX2Pipeline(Pipeline):
             "audio_timestamps": audio_timestamps,
             "frame_rate": frame_rate,
         }
+        if emit_discontinuity:
+            chunk["discontinuity"] = True
+        return chunk
+
+    def _make_hold_chunk(
+        self,
+        num_frames: int,
+        frame_rate: float,
+        idle_loop_path: str | None = None,
+    ) -> dict:
+        """Build a chunk that fills the hold period with silent audio plus
+        either a cycle of the configured idle-loop clip or, if none is set
+        (or it failed to load), copies of the cached last frame."""
+        last = self._last_video_frame
+        assert last is not None
+
+        loop_frames = self._load_idle_loop_frames(
+            idle_loop_path,
+            target_hw=tuple(last.shape[:2]),
+        )
+        if loop_frames is not None:
+            m = loop_frames.shape[0]
+            idx = (self._idle_loop_cursor + torch.arange(num_frames)) % m
+            video = loop_frames.index_select(0, idx).clone()
+            self._idle_loop_cursor = int((self._idle_loop_cursor + num_frames) % m)
+        else:
+            video = last.unsqueeze(0).expand(num_frames, -1, -1, -1).contiguous()
+
+        # Match the prior real chunk's sample rate so the audio stream
+        # doesn't see a hidden sample-rate change at hold entry.
+        audio_sample_rate = self._last_audio_sample_rate
+        audio_samples = max(1, int(round(num_frames * audio_sample_rate / frame_rate)))
+        audio = torch.zeros(2, audio_samples)
+
+        video_timestamps, audio_timestamps = self._advance_chunk_timestamps(
+            num_frames=video.shape[0],
+            audio_samples=audio.shape[-1],
+            audio_sample_rate=audio_sample_rate,
+        )
+
+        # Hold chunks are essentially free (tensor copy + zeros); pace
+        # strictly against wall-clock so cheap chunks don't burst into the
+        # downstream queues and drift the audio buffer out of sync.
+        self._realtime_throttle(0.0, force=True)
+
+        self._last_chunk_was_hold = True
+
+        return {
+            "video": video,
+            "video_timestamps": video_timestamps,
+            "audio": audio,
+            "audio_sample_rate": audio_sample_rate,
+            "audio_timestamps": audio_timestamps,
+            "frame_rate": frame_rate,
+        }
+
+    def _load_idle_loop_frames(
+        self,
+        path: str | None,
+        target_hw: tuple[int, int],
+    ) -> torch.Tensor | None:
+        """Load and cache the idle-loop clip as ``(M, H, W, C)`` float32 in
+        ``[0, 1]`` on CPU, matching the pipeline's video output format.
+
+        Cached by ``(path, target_hw)`` so a path change or a resize forces
+        a reload. Returns ``None`` if no path is set or loading fails — the
+        caller then falls back to the last-frame hold behaviour.
+        """
+        if not path:
+            if self._idle_loop_frames is not None:
+                self._idle_loop_frames = None
+                self._idle_loop_cache_key = None
+                self._idle_loop_cursor = 0
+            return None
+
+        cache_key = (path, target_hw)
+        if (
+            self._idle_loop_frames is not None
+            and self._idle_loop_cache_key == cache_key
+        ):
+            return self._idle_loop_frames
+
+        try:
+            import imageio.v3 as iio
+            video = iio.imread(path, plugin="pyav")  # (M, H, W, C) uint8
+            if video.ndim != 4 or video.shape[-1] < 3:
+                raise ValueError(f"unexpected video shape {video.shape}")
+            frames = torch.from_numpy(video[..., :3]).to(torch.float32) / 255.0
+            h, w = target_hw
+            if frames.shape[1] != h or frames.shape[2] != w:
+                # (M, H, W, C) -> (M, C, H, W) for the resize op, then back.
+                chw = frames.permute(0, 3, 1, 2)
+                chw = torch.nn.functional.interpolate(
+                    chw, size=(h, w), mode="bilinear", align_corners=False
+                )
+                frames = chw.permute(0, 2, 3, 1).contiguous()
+            self._idle_loop_frames = frames
+            self._idle_loop_cache_key = cache_key
+            self._idle_loop_cursor = 0
+            logger.info(
+                f"Loaded idle loop {path}: {frames.shape[0]} frames @ {h}x{w}"
+            )
+            return frames
+        except Exception as e:
+            logger.warning(f"Failed to load idle loop '{path}': {e}")
+            # Negative-cache so we don't retry the same broken path each chunk.
+            self._idle_loop_frames = None
+            self._idle_loop_cache_key = cache_key
+            return None
 
     # ------------------------------------------------------------------
     # Transformer GPU streaming
